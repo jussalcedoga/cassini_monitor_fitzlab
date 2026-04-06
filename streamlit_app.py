@@ -271,47 +271,97 @@ def make_multi_trace_figure(
     for key, df in series.items():
         if df.empty:
             continue
+
+        line_width = 4.5 if str(key).startswith("P") else 4.0
+
         fig.add_trace(
             go.Scatter(
                 x=df["ts_eastern"],
                 y=df["value"],
                 mode="lines",
                 name=PRETTY_NAMES.get(key, key),
-                line=dict(color=COLORS.get(key), width=3.2),
+                line=dict(color=COLORS.get(key), width=line_width),
                 hovertemplate="%{x|%Y-%m-%d %H:%M}<br>%{y}<extra>%{fullData.name}</extra>",
             )
         )
 
     fig.update_layout(
-        title=dict(text=title, x=0.02, xanchor="left", y=0.97),
-        template="plotly_dark",
+        title=dict(
+            text=title,
+            x=0.02,
+            xanchor="left",
+            y=0.98,
+            yanchor="top",
+            font=dict(size=20, color="black"),
+        ),
+        template="none",
+        paper_bgcolor="white",
+        plot_bgcolor="white",
         hovermode="x unified",
         autosize=False,
         width=980,
         height=height,
-        margin=dict(l=30, r=30, t=110, b=40),
+        margin=dict(
+            l=60,
+            r=35,
+            t=130,
+            b=75,
+        ),
         legend=dict(
             orientation="h",
             yanchor="bottom",
-            y=1.08,
+            y=1.10,
             xanchor="left",
             x=0,
             bgcolor="rgba(0,0,0,0)",
-            font=dict(size=13),
+            font=dict(size=13, color="black"),
             itemwidth=70,
+            tracegroupgap=8,
         ),
+        font=dict(color="black"),
         xaxis=dict(
-            title="Time",
+            title=dict(
+                text="Time",
+                standoff=18,
+                font=dict(size=15, color="black"),
+            ),
             tickformat="%b %d\n%H:%M",
+            tickfont=dict(size=12, color="black"),
+            showgrid=False,
+            zeroline=False,
+            showline=True,
+            linewidth=1.2,
+            linecolor="black",
+            ticks="outside",
+            ticklen=6,
+            tickwidth=1.2,
+            tickcolor="black",
+            automargin=True,
         ),
-        yaxis=dict(title=yaxis_title,),
+        yaxis=dict(
+            title=dict(
+                text=yaxis_title,
+                standoff=18,
+                font=dict(size=15, color="black"),
+            ),
+            tickfont=dict(size=12, color="black"),
+            showgrid=False,
+            zeroline=False,
+            showline=True,
+            linewidth=1.2,
+            linecolor="black",
+            ticks="outside",
+            ticklen=6,
+            tickwidth=1.2,
+            tickcolor="black",
+            automargin=True,
+        ),
     )
 
     if log_y:
         fig.update_yaxes(type="log")
 
     return fig
-
 # ----------------------------
 # Sidebar
 # ----------------------------
