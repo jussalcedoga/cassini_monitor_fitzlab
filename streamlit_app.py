@@ -130,11 +130,19 @@ PRETTY_NAMES = {
     "total_hours_scroll_2": "Scroll 2 Hours",
 }
 
+# BlueFors-like temperature colors
+color_map = {
+    "T_50K": "#FE2A2A",
+    "T_4K": "#54D400",
+    "T_Still": "#FECB00",
+    "T_MXC": "#0065FF",
+}
+
 COLORS = {
-    "T_50K": "#ef4444",
-    "T_4K": "#f59e0b",
-    "T_Still": "#38bdf8",
-    "T_MXC": "#22c55e",
+    "T_50K": color_map["T_50K"],
+    "T_4K": color_map["T_4K"],
+    "T_Still": color_map["T_Still"],
+    "T_MXC": color_map["T_MXC"],
     "P1": "#8b5cf6",
     "P2": "#ec4899",
     "P3": "#f97316",
@@ -231,9 +239,6 @@ def fetch_history_df(key: str, hours: int) -> pd.DataFrame:
     df["ts_eastern"] = pd.to_datetime(df["ts_eastern"], errors="coerce")
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
     df = df.dropna(subset=["ts_eastern"]).sort_values("ts_eastern").copy()
-
-    # Data is already Eastern wall-clock time from the backend/warehouse.
-    # We keep the timestamps as-is and label the axis explicitly as Boston time.
     return df
 
 @st.cache_data(show_spinner=False, ttl=20)
@@ -272,7 +277,7 @@ def make_multi_trace_figure(
         if df.empty:
             continue
 
-        line_width = 4.5 if str(key).startswith("P") else 4.0
+        line_width = 4.9 if str(key).startswith("P") else 4.4
 
         fig.add_trace(
             go.Scatter(
@@ -292,67 +297,67 @@ def make_multi_trace_figure(
             xanchor="left",
             y=0.98,
             yanchor="top",
-            font=dict(size=20, color="black"),
+            font=dict(size=22, color="black"),
         ),
         template="none",
         paper_bgcolor="white",
         plot_bgcolor="white",
         hovermode="x unified",
         autosize=False,
-        width=980,
+        width=1020,
         height=height,
         margin=dict(
-            l=60,
-            r=35,
-            t=130,
-            b=75,
+            l=78,
+            r=42,
+            t=145,
+            b=92,
         ),
         legend=dict(
             orientation="h",
             yanchor="bottom",
-            y=1.10,
+            y=1.12,
             xanchor="left",
             x=0,
             bgcolor="rgba(0,0,0,0)",
-            font=dict(size=13, color="black"),
-            itemwidth=70,
-            tracegroupgap=8,
+            font=dict(size=15, color="black"),
+            itemwidth=84,
+            tracegroupgap=10,
         ),
         font=dict(color="black"),
         xaxis=dict(
             title=dict(
                 text="Time",
-                standoff=18,
-                font=dict(size=15, color="black"),
+                standoff=22,
+                font=dict(size=18, color="black"),
             ),
             tickformat="%b %d\n%H:%M",
-            tickfont=dict(size=12, color="black"),
+            tickfont=dict(size=15, color="black"),
             showgrid=False,
             zeroline=False,
             showline=True,
-            linewidth=1.2,
+            linewidth=1.4,
             linecolor="black",
             ticks="outside",
-            ticklen=6,
-            tickwidth=1.2,
+            ticklen=7,
+            tickwidth=1.4,
             tickcolor="black",
             automargin=True,
         ),
         yaxis=dict(
             title=dict(
                 text=yaxis_title,
-                standoff=18,
-                font=dict(size=15, color="black"),
+                standoff=22,
+                font=dict(size=18, color="black"),
             ),
-            tickfont=dict(size=12, color="black"),
+            tickfont=dict(size=15, color="black"),
             showgrid=False,
             zeroline=False,
             showline=True,
-            linewidth=1.2,
+            linewidth=1.4,
             linecolor="black",
             ticks="outside",
-            ticklen=6,
-            tickwidth=1.2,
+            ticklen=7,
+            tickwidth=1.4,
             tickcolor="black",
             automargin=True,
         ),
@@ -362,6 +367,7 @@ def make_multi_trace_figure(
         fig.update_yaxes(type="log")
 
     return fig
+
 # ----------------------------
 # Sidebar
 # ----------------------------
@@ -476,12 +482,20 @@ with tabs[0]:
         unsafe_allow_html=True,
     )
 
+    temp_scale_overview = st.radio(
+        "Temperature axis scale",
+        ["Linear", "Log"],
+        horizontal=True,
+        key="temp_scale_overview",
+    )
+    temp_log_y_overview = temp_scale_overview == "Log"
+
     fig_temp = make_multi_trace_figure(
         temp_hist,
         title=f"Temperature channels, last {hours} h",
         yaxis_title="Temperature [K]",
-        log_y=False,
-        height=520,
+        log_y=temp_log_y_overview,
+        height=540,
     )
     st.plotly_chart(fig_temp, theme=None)
 
@@ -492,7 +506,7 @@ with tabs[0]:
         title=f"Pressure gauges, last {hours} h",
         yaxis_title="Pressure [arb.]",
         log_y=True,
-        height=540,
+        height=560,
     )
     st.plotly_chart(fig_press, theme=None)
 
@@ -506,11 +520,20 @@ with tabs[1]:
         unsafe_allow_html=True,
     )
 
+    temp_scale = st.radio(
+        "Temperature axis scale",
+        ["Linear", "Log"],
+        horizontal=True,
+        key="temp_scale_temperatures",
+    )
+    temp_log_y = temp_scale == "Log"
+
     fig_temp = make_multi_trace_figure(
         temp_hist,
         title=f"Temperature channels, last {hours} h",
         yaxis_title="Temperature [K]",
-        height=560,
+        log_y=temp_log_y,
+        height=580,
     )
     st.plotly_chart(fig_temp, theme=None)
 
@@ -549,7 +572,7 @@ with tabs[2]:
         title=f"Pressure gauges, last {hours} h",
         yaxis_title="Pressure [arb.]",
         log_y=True,
-        height=580,
+        height=600,
     )
     st.plotly_chart(fig_press, theme=None)
 
@@ -567,7 +590,7 @@ with tabs[2]:
         title=f"Flow, last {hours} h",
         yaxis_title="Flow",
         log_y=False,
-        height=430,
+        height=450,
     )
     st.plotly_chart(fig_flow, theme=None)
 
@@ -610,7 +633,7 @@ with tabs[3]:
         title=f"State timeline, last {hours} h",
         yaxis_title="State",
         log_y=False,
-        height=470,
+        height=500,
     )
     fig_state.update_yaxes(range=[-0.1, 1.1], tickvals=[0, 1])
     st.plotly_chart(fig_state, theme=None)
