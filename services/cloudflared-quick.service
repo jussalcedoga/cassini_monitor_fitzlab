@@ -1,0 +1,16 @@
+[Unit]
+Description=Cloudflare Quick Tunnel for Cassini API
+After=network.target cassini-api.service
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__ROOT__
+ExecStart=__ROOT__/scripts/run_cloudflared_quick.sh
+Restart=always
+RestartSec=5
+StandardOutput=append:__ROOT__/logs/cloudflared-quick.log
+StandardError=append:__ROOT__/logs/cloudflared-quick.log
+
+[Install]
+WantedBy=multi-user.target

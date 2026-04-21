@@ -1,0 +1,10 @@
+[Unit]
+Description=Cassini BlueFors DuckDB Sync
+
+[Service]
+Type=oneshot
+User=__USER__
+WorkingDirectory=__ROOT__
+ExecStart=__ROOT__/scripts/run_sync_once.sh
+StandardOutput=append:__ROOT__/logs/cassini-sync.log
+StandardError=append:__ROOT__/logs/cassini-sync.log

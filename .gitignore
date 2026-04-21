@@ -1,0 +1,12 @@
+backend/.env
+backend/.venv/
+backend/data/
+backend/logs/
+frontend/.venv/
+logs/
+cloudflared
+*.duckdb
+*.tmp
+__pycache__/
+*.pyc
+.DS_Store

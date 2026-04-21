@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Cassini sync every minute
+
+[Timer]
+OnCalendar=*-*-* *:*:00
+Persistent=true
+Unit=cassini-sync.service
+
+[Install]
+WantedBy=timers.target

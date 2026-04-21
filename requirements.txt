@@ -1,4 +1,1 @@
-streamlit
-plotly
-pandas
-requests
+-r frontend/requirements.txt

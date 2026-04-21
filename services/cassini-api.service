@@ -1,0 +1,16 @@
+[Unit]
+Description=Cassini BlueFors API
+After=network.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__ROOT__
+ExecStart=__ROOT__/scripts/run_api.sh
+Restart=always
+RestartSec=5
+StandardOutput=append:__ROOT__/logs/cassini-api.log
+StandardError=append:__ROOT__/logs/cassini-api.log
+
+[Install]
+WantedBy=multi-user.target
