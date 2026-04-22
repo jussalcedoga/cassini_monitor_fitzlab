@@ -412,6 +412,20 @@ def latest_timestamp_from_histories(histories: Dict[str, pd.DataFrame]):
     return max(timestamps)
 
 
+def freshest_value(latest: dict, histories: Dict[str, pd.DataFrame], key: str):
+    snapshot_value = latest.get(key)
+    snapshot_ts = pd.to_datetime(latest.get("ts_eastern"), errors="coerce")
+
+    history_df = histories.get(key, empty_history_df())
+    history_value = latest_history_value(history_df)
+    history_ts = pd.to_datetime(latest_history_timestamp(history_df), errors="coerce")
+
+    if not is_missing(history_value) and (pd.isna(snapshot_ts) or (not pd.isna(history_ts) and history_ts >= snapshot_ts)):
+        return history_value
+
+    return coalesce_value(snapshot_value, history_value)
+
+
 def merge_records(primary: dict, fallback: dict) -> dict:
     merged = dict(fallback or {})
     for key, value in (primary or {}).items():
@@ -448,45 +462,38 @@ def synthesize_latest_snapshot(latest: dict, metrics: dict, histories: Dict[str,
 
 
 def build_stage_temperature_history(temp_histories: Dict[str, pd.DataFrame]) -> pd.DataFrame:
-    aligned_histories: Dict[str, pd.DataFrame] = {}
+    merged_df = None
 
     for key in EM_STAGE_KEYS:
         source_df = temp_histories.get(key, empty_history_df())
         if source_df is None or source_df.empty:
-            aligned_histories[key] = pd.DataFrame(columns=["ts_eastern", "value"])
             continue
 
         stage_df = source_df[["ts_eastern", "value"]].copy()
         stage_df["ts_eastern"] = pd.to_datetime(stage_df["ts_eastern"], errors="coerce")
         stage_df["value"] = pd.to_numeric(stage_df["value"], errors="coerce")
-        stage_df = stage_df.dropna(subset=["ts_eastern"]).sort_values("ts_eastern").drop_duplicates(subset=["ts_eastern"], keep="last")
-        aligned_histories[key] = stage_df
-
-    populated = {key: df for key, df in aligned_histories.items() if not df.empty}
-    if not populated:
-        return pd.DataFrame(columns=["ts_eastern", *EM_STAGE_KEYS])
-
-    base_key = max(populated, key=lambda key: len(populated[key]))
-    base_df = populated[base_key][["ts_eastern"]].copy().sort_values("ts_eastern").drop_duplicates()
-    tolerance = pd.Timedelta(minutes=5)
-    merged_df = base_df.copy()
-
-    for key in EM_STAGE_KEYS:
-        stage_df = aligned_histories[key]
+        stage_df = stage_df.dropna(subset=["ts_eastern"]).copy()
         if stage_df.empty:
-            merged_df[key] = np.nan
             continue
 
-        aligned_df = pd.merge_asof(
-            base_df,
-            stage_df[["ts_eastern", "value"]].sort_values("ts_eastern"),
-            on="ts_eastern",
-            direction="nearest",
-            tolerance=tolerance,
-        )
-        merged_df[key] = aligned_df["value"]
+        stage_df["ts_eastern"] = stage_df["ts_eastern"].dt.floor("min")
+        stage_df = stage_df.sort_values("ts_eastern").drop_duplicates(subset=["ts_eastern"], keep="last")
+        stage_df = stage_df.rename(columns={"value": key})[["ts_eastern", key]]
 
-    return merged_df.reset_index(drop=True)
+        if merged_df is None:
+            merged_df = stage_df
+        else:
+            merged_df = merged_df.merge(stage_df, on="ts_eastern", how="outer")
+
+    if merged_df is None or merged_df.empty:
+        return pd.DataFrame(columns=["ts_eastern", *EM_STAGE_KEYS])
+
+    for key in EM_STAGE_KEYS:
+        if key not in merged_df:
+            merged_df[key] = np.nan
+
+    merged_df = merged_df.sort_values("ts_eastern").reset_index(drop=True)
+    return merged_df[["ts_eastern", *EM_STAGE_KEYS]]
 
 
 def compute_em_history(temp_histories: Dict[str, pd.DataFrame], latest: dict, stage_attens_db: Dict[str, float], freq_ghz: float, room_temp_k: float = EM_ROOM_TEMP_DEFAULT_K) -> Dict[str, pd.DataFrame]:
@@ -1277,11 +1284,16 @@ def render_dashboard_page():
             f"Still ({em_stage_attens['T_Still']:.0f} dB) -> "
             f"MXC ({em_stage_attens['T_MXC']:.0f} dB), evaluated at {em_freq_ghz:.1f} GHz."
         )
+        if np.isclose(em_stage_attens["T_50K"], 0.0):
+            st.caption(
+                "With 0 dB at 50 K, the line is not thermalized there, so the effective line temperature can stay close to the room source until the first colder attenuator."
+            )
+        st.caption("Cards report the effective line temperature after each stage. The local plate temperature and attenuation are shown beneath each card.")
 
         em_latest_stage_temps: Dict[str, float] = {}
         em_missing_keys = []
         for key in EM_STAGE_KEYS:
-            value = coalesce_value(latest.get(key), latest_history_value(temp_hist.get(key, empty_history_df())))
+            value = freshest_value(latest, temp_hist, key)
             if is_missing(value):
                 em_missing_keys.append(PRETTY_NAMES[key])
             else:
@@ -1301,17 +1313,16 @@ def render_dashboard_page():
             for col, key in zip(em_metric_cols, EM_STAGE_KEYS):
                 with col:
                     render_metric_box(
-                        PRETTY_NAMES[key],
+                        f"After {PRETTY_NAMES[key]}",
                         fmt_em_temp(float(np.asarray(em_teff_latest[key]).reshape(-1)[-1])),
-                        f"Effective temperature at {em_freq_ghz:.1f} GHz",
+                        f"Plate {fmt_temp(em_latest_stage_temps[key])} • local atten {em_stage_attens[key]:.0f} dB",
                     )
 
             st.write("")
             with st.expander("Model assumptions", expanded=False):
                 st.markdown(
-                    "This tab uses the same thermal beam-splitter recurrence from the reference code: "
-                    r"$\bar n_{\mathrm{out}} = \bar n_{\mathrm{in}}/L + (1 - 1/L)\bar n(T_i, f)$ with $L = 10^{A_i/10}$. "
-                    "The output occupation of each stage is then converted to an effective temperature by inverting the Bose-Einstein relation."
+                    "This tab follows the same stage-by-stage thermal beam-splitter model as the reference implementation. "
+                    "Each attenuator partially transmits the incoming thermal occupation according to its linear loss and adds noise set by the most recent local stage temperature, then the resulting occupation is converted into an effective temperature at the selected frequency."
                 )
 
             if plot_em_history:
