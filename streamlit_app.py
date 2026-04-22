@@ -61,6 +61,8 @@ PRETTY_NAMES = {
     "total_hours_scroll_2": "Scroll 2 Hours",
 }
 
+PRESSURE_UNIT = "mbar"
+
 COLORS = {
     "T_50K": "#FE2A2A",
     "T_4K": "#54D400",
@@ -137,14 +139,15 @@ st.markdown(
         margin-bottom: 0.75rem;
     }
     .login-title {
-        color: white;
+        color: var(--st-text-color, var(--text-color, #0f172a));
         font-size: clamp(2.35rem, 4.6vw, 3.75rem);
         font-weight: 800;
         line-height: 1.05;
         margin-bottom: 0.6rem;
     }
     .login-copy {
-        color: #cbd5e1;
+        color: var(--st-text-color, var(--text-color, #475569));
+        opacity: 0.82;
         font-size: 1rem;
         line-height: 1.55;
         margin-bottom: 0.95rem;
@@ -163,10 +166,19 @@ st.markdown(
         margin-bottom: 0.25rem;
     }
     .hero-copy {
-        color: #94a3b8;
+        color: var(--st-text-color, var(--text-color, #475569));
+        opacity: 0.82;
         font-size: 1rem;
         line-height: 1.5;
         margin-top: -0.2rem;
+    }
+    .hero-title {
+        color: var(--st-text-color, var(--text-color, #0f172a));
+        font-size: clamp(2.5rem, 5vw, 4.25rem);
+        font-weight: 800;
+        line-height: 1.02;
+        margin: 0 0 0.45rem 0;
+        letter-spacing: -0.03em;
     }
     .hero-meta {
         color: #64748b;
@@ -225,10 +237,10 @@ def render_login_page():
             if cassini is not None:
                 st.image(cassini, width=230)
 
-        st.markdown('<div class="login-kicker">Fitz Laboratory • Dartmouth Engineering</div>', unsafe_allow_html=True)
+        st.markdown('<div class="login-kicker">FitzLab • Dartmouth Engineering</div>', unsafe_allow_html=True)
         st.markdown('<div class="login-title">Cassini BlueFors Dashboard</div>', unsafe_allow_html=True)
         st.markdown(
-            '<div class="login-copy">Watching the Cassini cryostat breathe in real time with live temperatures, pressures, and pump-state telemetry pulled from the BlueFors log stream.</div>',
+            '<div class="login-copy">Secure access to live BlueFors temperatures, pressures, pump states, and cooldown history.</div>',
             unsafe_allow_html=True,
         )
 
@@ -244,7 +256,7 @@ def render_login_page():
             "[FitzLab Website](https://sites.google.com/view/fitzlab/home)  |  [Main Designer: Juan Salcedo](https://www.linkedin.com/in/jussalcedoga/)"
         )
         st.markdown(
-            '<div class="login-meta">Built for FitzLab at Dartmouth. Once you are in, the dashboard can refresh in place so you do not have to log in again just to see the latest point.</div>',
+            '<div class="login-meta">Built for FitzLab at Dartmouth. Once you are in, the dashboard refreshes in place so you can follow the latest point without logging in again.</div>',
             unsafe_allow_html=True,
         )
 
@@ -441,16 +453,6 @@ def fridge_state(latest: dict, histories: Dict[str, pd.DataFrame]) -> tuple[str,
     return ("Cooled", "Cryostat is holding near its base temperature") if mxc < 0.05 else ("Cooling down", "Cryostat is settling toward a colder state")
 
 
-def latest_age_minutes(ts_value) -> Optional[float]:
-    ts = pd.to_datetime(ts_value, errors="coerce")
-    if pd.isna(ts):
-        return None
-    now = pd.Timestamp.now().tz_localize(None)
-    if getattr(ts, "tzinfo", None) is not None:
-        ts = ts.tz_convert(None)
-    return float((now - ts).total_seconds() / 60.0)
-
-
 @st.cache_data(show_spinner=False, ttl=20)
 def load_dashboard(hours: int):
     health = {}
@@ -503,7 +505,7 @@ def fmt_temp(v: Optional[float], always_mk: bool = False) -> str:
     if v is None or pd.isna(v):
         return "—"
     v = float(v)
-    if always_mk:
+    if always_mk and abs(v) < 1.0:
         return f"{v * 1e3:,.1f} mK"
     if abs(v) < 0.1:
         return f"{v * 1e3:.1f} mK"
@@ -517,14 +519,14 @@ def fmt_pressure(v: Optional[float]) -> str:
         return "—"
     v = float(v)
     if v == 0:
-        return "0"
+        return f"0 {PRESSURE_UNIT}"
     if abs(v) < 1e-2 or abs(v) >= 1e3:
-        return f"{v:.2e}"
+        return f"{v:.2e} {PRESSURE_UNIT}"
     if abs(v) < 1:
-        return f"{v:.4f}"
+        return f"{v:.4f} {PRESSURE_UNIT}"
     if abs(v) < 100:
-        return f"{v:.3f}"
-    return f"{v:.1f}"
+        return f"{v:.3f} {PRESSURE_UNIT}"
+    return f"{v:.1f} {PRESSURE_UNIT}"
 
 
 def fmt_flow(v: Optional[float]) -> str:
@@ -638,6 +640,11 @@ def make_multi_trace_figure(
             continue
 
         line_width = 4.9 if str(key).startswith("P") else 4.4
+        value_suffix = ""
+        if key in PRESSURE_KEYS:
+            value_suffix = f" {PRESSURE_UNIT}"
+        elif key in TEMPERATURE_KEYS:
+            value_suffix = " K"
         fig.add_trace(
             go.Scattergl(
                 x=df["ts_eastern"],
@@ -645,7 +652,7 @@ def make_multi_trace_figure(
                 mode="lines",
                 name=PRETTY_NAMES.get(key, key),
                 line=dict(color=COLORS.get(key), width=line_width),
-                hovertemplate="%{x|%Y-%m-%d %H:%M}<br>%{y}<extra>%{fullData.name}</extra>",
+                hovertemplate=f"%{{x|%Y-%m-%d %H:%M}}<br>%{{y}}{value_suffix}<extra>%{{fullData.name}}</extra>",
             )
         )
 
@@ -747,7 +754,7 @@ with st.sidebar:
     )
 
     st.markdown("---")
-    st.caption("Fitz Laboratory • Dartmouth Engineering")
+    st.caption("FitzLab • Dartmouth Engineering")
     st.markdown("### API endpoint")
     st.code(API_BASE, language=None)
     st.markdown("[FitzLab Website](https://sites.google.com/view/fitzlab/home)")
@@ -804,17 +811,16 @@ def render_dashboard_page():
         if logo is not None:
             st.image(logo, width=150)
     with hero_cols[1]:
-        st.markdown('<div class="hero-kicker">Fitz Laboratory • Dartmouth Engineering</div>', unsafe_allow_html=True)
-        st.title("Cassini BlueFors Dashboard")
+        st.markdown('<div class="hero-kicker">FitzLab • Dartmouth Engineering</div>', unsafe_allow_html=True)
+        st.markdown('<div class="hero-title">Cassini BlueFors Dashboard</div>', unsafe_allow_html=True)
         st.markdown(
-            '<div class="hero-copy">Live cryostat telemetry, cooldown health, and operations monitoring for the Cassini platform, sourced from the BlueFors logs and served through the FitzLab monitor stack.</div>',
+            '<div class="hero-copy">Live BlueFors temperatures, pressures, pump states, and cooldown history for Cassini.</div>',
             unsafe_allow_html=True,
         )
         st.markdown(
             f'<div class="hero-meta">Auto-refresh: {format_refresh_label(auto_refresh_seconds)}</div>',
             unsafe_allow_html=True,
         )
-        st.markdown("[FitzLab Website](https://sites.google.com/view/fitzlab/home)  |  [Main Designer: Juan Salcedo](https://www.linkedin.com/in/jussalcedoga/)")
     with hero_cols[2]:
         if cassini is not None:
             st.image(cassini, use_container_width=True)
@@ -832,17 +838,13 @@ def render_dashboard_page():
         )
 
     if stale_snapshot:
-        st.warning("Showing the last successful dashboard snapshot because the latest API refresh failed.")
+        st.caption("Showing the last successful refresh because the latest API request failed.")
 
     latest_ts = latest.get("ts_eastern")
     if latest_ts:
         st.caption(f"Last available data point in database: {latest_ts}")
     else:
         st.caption("Last available data point unavailable")
-
-    latest_age = latest_age_minutes(latest_ts)
-    if latest_age is not None and latest_age > 15:
-        st.warning(f"Live data is lagging by about {latest_age:.0f} minutes. The parquet updater or public API may need attention.")
 
     state_bar = "".join(
         [
@@ -879,14 +881,16 @@ def render_dashboard_page():
             unsafe_allow_html=True,
         )
 
-        row1 = st.columns(4, gap="large")
+        row1 = st.columns(5, gap="medium")
         with row1[0]:
-            render_metric_box("Mixing Chamber", fmt_temp(latest.get("T_MXC"), always_mk=True), "Current MXC temperature reported in mK")
+            render_metric_box("Mixing Chamber", fmt_temp(latest.get("T_MXC"), always_mk=True), "Current MXC temperature")
         with row1[1]:
-            render_metric_box("Still", fmt_temp(latest.get("T_Still"), always_mk=True), "Current still temperature reported in mK")
+            render_metric_box("Still", fmt_temp(latest.get("T_Still"), always_mk=True), "Current still temperature")
         with row1[2]:
-            render_metric_box("P1", fmt_pressure(latest.get("P1")), "Latest pressure gauge P1")
+            render_metric_box("Fridge state", fridge_status, fridge_status_help)
         with row1[3]:
+            render_metric_box("P1", fmt_pressure(latest.get("P1")), f"Latest pressure gauge P1 [{PRESSURE_UNIT}]")
+        with row1[4]:
             render_metric_box("Flow", fmt_flow(latest.get("Flow")), "Latest flow value")
 
         st.write("")
@@ -932,7 +936,7 @@ def render_dashboard_page():
         fig_press = make_multi_trace_figure(
             press_hist,
             title=f"Pressure gauges, last {hours} h",
-            yaxis_title="Pressure [arb.]",
+            yaxis_title=f"Pressure [{PRESSURE_UNIT}]",
             log_y=True,
             height=560,
         )
@@ -1003,7 +1007,7 @@ def render_dashboard_page():
         fig_press = make_multi_trace_figure(
             press_hist,
             title=f"Pressure gauges, last {hours} h",
-            yaxis_title="Pressure [arb.]",
+            yaxis_title=f"Pressure [{PRESSURE_UNIT}]",
             log_y=True,
             height=600,
         )
@@ -1019,7 +1023,7 @@ def render_dashboard_page():
         pcols = st.columns(6, gap="small")
         for col, key in zip(pcols, PRESSURE_KEYS):
             with col:
-                render_metric_box(key, fmt_pressure(latest.get(key)), "Latest value")
+                render_metric_box(key, fmt_pressure(latest.get(key)), f"Latest value [{PRESSURE_UNIT}]")
 
         st.write("")
 
