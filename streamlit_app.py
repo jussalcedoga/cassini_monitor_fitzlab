@@ -9,6 +9,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from PIL import Image
 
 API_BASE = st.secrets["api_base"].rstrip("/")
@@ -139,7 +140,7 @@ st.markdown(
         margin-bottom: 0.75rem;
     }
     .login-title {
-        color: var(--st-text-color, var(--text-color, #0f172a));
+        color: #0f172a;
         font-size: clamp(2.35rem, 4.6vw, 3.75rem);
         font-weight: 800;
         line-height: 1.05;
@@ -173,7 +174,7 @@ st.markdown(
         margin-top: 0.15rem;
     }
     .hero-title {
-        color: var(--st-text-color, var(--text-color, #0f172a));
+        color: #0f172a;
         font-size: clamp(2.5rem, 5vw, 4.25rem);
         font-weight: 800;
         line-height: 1.08;
@@ -193,6 +194,24 @@ st.markdown(
         font-size: 0.92rem;
         margin-bottom: 0.85rem;
     }
+    html[data-cassini-theme="dark"] .login-title,
+    html[data-cassini-theme="dark"] .hero-title {
+        color: #f8fafc !important;
+    }
+    html[data-cassini-theme="dark"] .login-copy,
+    html[data-cassini-theme="dark"] .hero-copy {
+        color: #cbd5e1 !important;
+        opacity: 0.9;
+    }
+    html[data-cassini-theme="light"] .login-title,
+    html[data-cassini-theme="light"] .hero-title {
+        color: #0f172a !important;
+    }
+    html[data-cassini-theme="light"] .login-copy,
+    html[data-cassini-theme="light"] .hero-copy {
+        color: #475569 !important;
+        opacity: 0.82;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -200,6 +219,30 @@ st.markdown(
 
 if "ok" not in st.session_state:
     st.session_state.ok = False
+
+
+def mount_theme_bridge() -> None:
+    components.html(
+        """
+        <script>
+        const applyCassiniTheme = () => {
+          const parentDoc = window.parent.document;
+          const app = parentDoc.querySelector('.stApp');
+          if (!app) return;
+          const scheme = window.parent.getComputedStyle(app).getPropertyValue('color-scheme').trim() || 'light';
+          parentDoc.documentElement.setAttribute('data-cassini-theme', scheme);
+        };
+        applyCassiniTheme();
+        const observer = new MutationObserver(applyCassiniTheme);
+        observer.observe(window.parent.document.body, { childList: true, subtree: true, attributes: true });
+        window.addEventListener('beforeunload', () => observer.disconnect(), { once: true });
+        </script>
+        """,
+        height=0,
+    )
+
+
+mount_theme_bridge()
 
 
 def asset_path(name: str) -> Path:
