@@ -39,6 +39,17 @@ PRESSURE_KEYS = ["P1", "P2", "P3", "P4", "P5", "P6"]
 FLOW_KEYS = ["Flow"]
 STATE_KEYS = ["pulse_tube", "turbo_1", "scroll_1", "scroll_2"]
 HISTORY_KEYS = TEMPERATURE_KEYS + PRESSURE_KEYS + FLOW_KEYS + STATE_KEYS
+EM_STAGE_KEYS = ["T_50K", "T_4K", "T_Still", "T_MXC"]
+EM_DEFAULT_ATTEN_DB = {
+    "T_50K": 0.0,
+    "T_4K": 20.0,
+    "T_Still": 20.0,
+    "T_MXC": 20.0,
+}
+EM_ROOM_TEMP_DEFAULT_K = 300.0
+EM_DEFAULT_FREQ_GHZ = 5.0
+K_B = 1.380649e-23
+H = 6.62607015e-34
 
 PRETTY_NAMES = {
     "T_50K": "50 K Stage",
@@ -436,6 +447,56 @@ def synthesize_latest_snapshot(latest: dict, metrics: dict, histories: Dict[str,
     return snapshot
 
 
+def build_stage_temperature_history(temp_histories: Dict[str, pd.DataFrame], latest: dict) -> pd.DataFrame:
+    merged_df: Optional[pd.DataFrame] = None
+
+    for key in EM_STAGE_KEYS:
+        source_df = temp_histories.get(key, empty_history_df())
+        if source_df is not None and not source_df.empty:
+            stage_df = source_df[["ts_eastern", "value"]].rename(columns={"value": key}).copy()
+        else:
+            stage_df = pd.DataFrame(columns=["ts_eastern", key])
+            ts_value = pd.to_datetime(latest.get("ts_eastern"), errors="coerce")
+            latest_value = coalesce_value(latest.get(key), latest_history_value(temp_histories.get(key, empty_history_df())))
+            if pd.notna(ts_value) and not is_missing(latest_value):
+                stage_df = pd.DataFrame({"ts_eastern": [ts_value], key: [float(latest_value)]})
+
+        merged_df = stage_df if merged_df is None else merged_df.merge(stage_df, on="ts_eastern", how="outer")
+
+    if merged_df is None or merged_df.empty:
+        return pd.DataFrame(columns=["ts_eastern", *EM_STAGE_KEYS])
+
+    merged_df["ts_eastern"] = pd.to_datetime(merged_df["ts_eastern"], errors="coerce")
+    merged_df = merged_df.dropna(subset=["ts_eastern"]).sort_values("ts_eastern").copy()
+
+    for key in EM_STAGE_KEYS:
+        merged_df[key] = pd.to_numeric(merged_df.get(key), errors="coerce").ffill()
+        fallback_value = coalesce_value(latest.get(key), latest_history_value(temp_histories.get(key, empty_history_df())))
+        if not is_missing(fallback_value):
+            merged_df[key] = merged_df[key].fillna(float(fallback_value))
+
+    return merged_df.dropna(subset=EM_STAGE_KEYS, how="all").reset_index(drop=True)
+
+
+def compute_em_history(temp_histories: Dict[str, pd.DataFrame], latest: dict, stage_attens_db: Dict[str, float], freq_ghz: float, room_temp_k: float = EM_ROOM_TEMP_DEFAULT_K) -> Dict[str, pd.DataFrame]:
+    temperature_history = build_stage_temperature_history(temp_histories, latest)
+    if temperature_history.empty:
+        return {}
+
+    stage_temps = {key: temperature_history[key].to_numpy(dtype=float) for key in EM_STAGE_KEYS}
+    _, teff_map = compute_em_chain(stage_temps, stage_attens_db, freq_ghz, room_temp_k=room_temp_k)
+
+    return {
+        key: pd.DataFrame(
+            {
+                "ts_eastern": temperature_history["ts_eastern"],
+                "value": np.asarray(teff_map[key], dtype=float),
+            }
+        )
+        for key in EM_STAGE_KEYS
+    }
+
+
 def recent_temperature_slope(df: pd.DataFrame, lookback_hours: int = 3) -> Optional[float]:
     if df.empty or len(df) < 2:
         return None
@@ -584,6 +645,17 @@ def fmt_flow(v: Optional[float]) -> str:
     return f"{float(v):.4f}"
 
 
+def fmt_em_temp(v: Optional[float]) -> str:
+    if v is None or pd.isna(v):
+        return "—"
+    v = float(v)
+    if abs(v) < 0.5:
+        return f"{v * 1e3:,.1f} mK"
+    if abs(v) < 10:
+        return f"{v:.3f} K"
+    return f"{v:.2f} K"
+
+
 def fmt_hours(v: Optional[float]) -> str:
     if v is None or pd.isna(v):
         return "—"
@@ -612,6 +684,48 @@ def chip_color(v: Optional[float]) -> str:
     if v is None or pd.isna(v):
         return "#64748b"
     return "#16a34a" if float(v) >= 0.5 else "#dc2626"
+
+
+def thermal_n(temp_k, freq_ghz: float):
+    temp = np.asarray(temp_k, dtype=float)
+    temp = np.maximum(temp, 1e-9)
+    freq_hz = float(freq_ghz) * 1e9
+    exponent = (H * freq_hz) / (K_B * temp)
+    with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+        n = 1.0 / np.expm1(exponent)
+    return np.where(np.isfinite(n), n, 0.0)
+
+
+def n_to_teff(n, freq_ghz: float):
+    occupation = np.maximum(np.asarray(n, dtype=float), 1e-20)
+    freq_hz = float(freq_ghz) * 1e9
+    hf_over_k = (H * freq_hz) / K_B
+    with np.errstate(divide="ignore", invalid="ignore"):
+        temp = hf_over_k / np.log1p(1.0 / occupation)
+    return np.where(np.isfinite(temp), temp, 0.0)
+
+
+def compute_em_chain(stage_temps: Dict[str, object], stage_attens_db: Dict[str, float], freq_ghz: float, room_temp_k: float = EM_ROOM_TEMP_DEFAULT_K):
+    n_in = thermal_n(room_temp_k, freq_ghz)
+    n_eff: Dict[str, object] = {}
+    t_eff: Dict[str, object] = {}
+
+    for key in EM_STAGE_KEYS:
+        atten_db = float(stage_attens_db[key])
+        loss = 10 ** (atten_db / 10.0)
+        stage_temp = np.asarray(stage_temps[key], dtype=float)
+        stage_occupation = thermal_n(stage_temp, freq_ghz)
+
+        if np.isclose(loss, 1.0):
+            n_out = np.array(n_in, copy=True)
+        else:
+            n_out = n_in / loss + (1.0 - 1.0 / loss) * stage_occupation
+
+        n_eff[key] = n_out
+        t_eff[key] = n_to_teff(n_out, freq_ghz)
+        n_in = n_out
+
+    return n_eff, t_eff
 
 
 def render_metric_box(title: str, value: str, help_text: str = ""):
@@ -925,7 +1039,7 @@ def render_dashboard_page():
         total_below_20mk = below_20mk_h
         total_below_20mk_help = f"Reported over the available {hours}-hour window"
 
-    tabs = st.tabs(["Overview", "Temperatures", "Pressures", "Operations"])
+    tabs = st.tabs(["Overview", "Temperatures", "Pressures", "Operations", "Effective EM Environment"])
 
     with tabs[0]:
         st.markdown("### Current state")
@@ -1169,6 +1283,128 @@ def render_dashboard_page():
             f"The most recent database row is timestamped {latest_ts if latest_ts else 'unavailable'}. "
             "If this drifts far behind wall-clock time, the sync job or the upstream parquet update may be lagging."
         )
+
+    with tabs[4]:
+        st.markdown("### Effective EM Environment")
+        st.markdown(
+            '<div class="section-caption">Equivalent microwave line temperature from room temperature through the attenuator chain, using the live BlueFors stage temperatures.</div>',
+            unsafe_allow_html=True,
+        )
+
+        em_config_top = st.columns([1.1, 1.1, 1.4], gap="medium")
+        with em_config_top[0]:
+            em_freq_ghz = st.number_input(
+                "Reference frequency [GHz]",
+                min_value=1.0,
+                max_value=20.0,
+                value=float(EM_DEFAULT_FREQ_GHZ),
+                step=0.1,
+                key="em_reference_frequency_ghz",
+            )
+        with em_config_top[1]:
+            em_room_temp_k = st.number_input(
+                "Room input [K]",
+                min_value=1.0,
+                max_value=400.0,
+                value=float(EM_ROOM_TEMP_DEFAULT_K),
+                step=1.0,
+                key="em_room_temperature_k",
+            )
+        with em_config_top[2]:
+            plot_em_history = st.checkbox(
+                "Plot evolution over time",
+                value=False,
+                key="em_plot_history",
+                help="Use the current attenuation settings to replay the effective line temperature over the selected dashboard window.",
+            )
+
+        em_atten_cols = st.columns(4, gap="medium")
+        em_stage_attens: Dict[str, float] = {}
+        for col, key in zip(em_atten_cols, EM_STAGE_KEYS):
+            with col:
+                em_stage_attens[key] = st.number_input(
+                    f"{PRETTY_NAMES[key]} atten. [dB]",
+                    min_value=0.0,
+                    max_value=60.0,
+                    value=float(EM_DEFAULT_ATTEN_DB[key]),
+                    step=1.0,
+                    key=f"em_atten_{key}",
+                )
+
+        st.caption(
+            "Model: "
+            f"{em_room_temp_k:.0f} K room source -> "
+            f"50 K ({em_stage_attens['T_50K']:.0f} dB) -> "
+            f"4 K ({em_stage_attens['T_4K']:.0f} dB) -> "
+            f"Still ({em_stage_attens['T_Still']:.0f} dB) -> "
+            f"MXC ({em_stage_attens['T_MXC']:.0f} dB), evaluated at {em_freq_ghz:.1f} GHz."
+        )
+
+        em_latest_stage_temps: Dict[str, float] = {}
+        em_missing_keys = []
+        for key in EM_STAGE_KEYS:
+            value = coalesce_value(latest.get(key), latest_history_value(temp_hist.get(key, empty_history_df())))
+            if is_missing(value):
+                em_missing_keys.append(PRETTY_NAMES[key])
+            else:
+                em_latest_stage_temps[key] = float(value)
+
+        if em_missing_keys:
+            st.info("Not enough live temperature data to evaluate: " + ", ".join(em_missing_keys))
+        else:
+            _, em_teff_latest = compute_em_chain(
+                em_latest_stage_temps,
+                em_stage_attens,
+                em_freq_ghz,
+                room_temp_k=em_room_temp_k,
+            )
+
+            em_metric_cols = st.columns(4, gap="large")
+            for col, key in zip(em_metric_cols, EM_STAGE_KEYS):
+                with col:
+                    render_metric_box(
+                        PRETTY_NAMES[key],
+                        fmt_em_temp(float(np.asarray(em_teff_latest[key]).reshape(-1)[-1])),
+                        f"Equivalent line temperature at {em_freq_ghz:.1f} GHz",
+                    )
+
+            with st.expander("Model assumptions", expanded=False):
+                st.markdown(
+                    "Each attenuator is treated as a thermalized beam splitter at its local stage temperature. "
+                    "The input line starts at the room-temperature source, and each stage attenuates the incoming occupation "
+                    "before passing the resulting noise forward to the next colder stage."
+                )
+
+            if plot_em_history:
+                em_history_series = compute_em_history(
+                    temp_hist,
+                    latest,
+                    em_stage_attens,
+                    em_freq_ghz,
+                    room_temp_k=em_room_temp_k,
+                )
+                if em_history_series:
+                    em_scale = st.radio(
+                        "Effective EM axis scale",
+                        ["Linear", "Log"],
+                        horizontal=True,
+                        key="em_environment_scale",
+                    )
+                    fig_em = make_multi_trace_figure(
+                        em_history_series,
+                        title=f"Effective EM environment, last {hours} h",
+                        yaxis_title="Effective temperature [K]",
+                        log_y=em_scale == "Log",
+                        height=560,
+                    )
+                    st.plotly_chart(
+                        fig_em,
+                        theme=None,
+                        use_container_width=True,
+                        config={"displaylogo": False, "responsive": True},
+                    )
+                else:
+                    st.info("Effective EM history is unavailable for the selected time window.")
 
 
 if auto_refresh_seconds > 0 and hasattr(st, "fragment"):
