@@ -86,7 +86,7 @@ st.markdown(
     """
     <style>
     .block-container {
-        padding-top: 1rem;
+        padding-top: 2.4rem;
         padding-bottom: 1.25rem;
         max-width: 1480px;
     }
@@ -129,7 +129,7 @@ st.markdown(
         margin-bottom: 0.35rem;
     }
     .login-spacer {
-        height: 3.1rem;
+        height: 4.8rem;
     }
     .login-kicker {
         color: #7dd3fc;
@@ -188,6 +188,9 @@ st.markdown(
     }
     .hero-spacer {
         height: 0.85rem;
+    }
+    .hero-top-spacer {
+        height: 1.4rem;
     }
     .refresh-note {
         color: #94a3b8;
@@ -851,6 +854,8 @@ def render_dashboard_page():
         else:
             api_ok = False
             api_error = str(exc)
+
+    st.markdown('<div class="hero-top-spacer"></div>', unsafe_allow_html=True)
 
     hero_cols = st.columns([0.18, 0.58, 0.24])
     with hero_cols[0]:
