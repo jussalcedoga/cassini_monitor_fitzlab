@@ -447,39 +447,50 @@ def synthesize_latest_snapshot(latest: dict, metrics: dict, histories: Dict[str,
     return snapshot
 
 
-def build_stage_temperature_history(temp_histories: Dict[str, pd.DataFrame], latest: dict) -> pd.DataFrame:
-    merged_df: Optional[pd.DataFrame] = None
+def build_stage_temperature_history(temp_histories: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    aligned_histories: Dict[str, pd.DataFrame] = {}
 
     for key in EM_STAGE_KEYS:
         source_df = temp_histories.get(key, empty_history_df())
-        if source_df is not None and not source_df.empty:
-            stage_df = source_df[["ts_eastern", "value"]].rename(columns={"value": key}).copy()
-        else:
-            stage_df = pd.DataFrame(columns=["ts_eastern", key])
-            ts_value = pd.to_datetime(latest.get("ts_eastern"), errors="coerce")
-            latest_value = coalesce_value(latest.get(key), latest_history_value(temp_histories.get(key, empty_history_df())))
-            if pd.notna(ts_value) and not is_missing(latest_value):
-                stage_df = pd.DataFrame({"ts_eastern": [ts_value], key: [float(latest_value)]})
+        if source_df is None or source_df.empty:
+            aligned_histories[key] = pd.DataFrame(columns=["ts_eastern", "value"])
+            continue
 
-        merged_df = stage_df if merged_df is None else merged_df.merge(stage_df, on="ts_eastern", how="outer")
+        stage_df = source_df[["ts_eastern", "value"]].copy()
+        stage_df["ts_eastern"] = pd.to_datetime(stage_df["ts_eastern"], errors="coerce")
+        stage_df["value"] = pd.to_numeric(stage_df["value"], errors="coerce")
+        stage_df = stage_df.dropna(subset=["ts_eastern"]).sort_values("ts_eastern").drop_duplicates(subset=["ts_eastern"], keep="last")
+        aligned_histories[key] = stage_df
 
-    if merged_df is None or merged_df.empty:
+    populated = {key: df for key, df in aligned_histories.items() if not df.empty}
+    if not populated:
         return pd.DataFrame(columns=["ts_eastern", *EM_STAGE_KEYS])
 
-    merged_df["ts_eastern"] = pd.to_datetime(merged_df["ts_eastern"], errors="coerce")
-    merged_df = merged_df.dropna(subset=["ts_eastern"]).sort_values("ts_eastern").copy()
+    base_key = max(populated, key=lambda key: len(populated[key]))
+    base_df = populated[base_key][["ts_eastern"]].copy().sort_values("ts_eastern").drop_duplicates()
+    tolerance = pd.Timedelta(minutes=5)
+    merged_df = base_df.copy()
 
     for key in EM_STAGE_KEYS:
-        merged_df[key] = pd.to_numeric(merged_df.get(key), errors="coerce").ffill()
-        fallback_value = coalesce_value(latest.get(key), latest_history_value(temp_histories.get(key, empty_history_df())))
-        if not is_missing(fallback_value):
-            merged_df[key] = merged_df[key].fillna(float(fallback_value))
+        stage_df = aligned_histories[key]
+        if stage_df.empty:
+            merged_df[key] = np.nan
+            continue
 
-    return merged_df.dropna(subset=EM_STAGE_KEYS, how="all").reset_index(drop=True)
+        aligned_df = pd.merge_asof(
+            base_df,
+            stage_df[["ts_eastern", "value"]].sort_values("ts_eastern"),
+            on="ts_eastern",
+            direction="nearest",
+            tolerance=tolerance,
+        )
+        merged_df[key] = aligned_df["value"]
+
+    return merged_df.reset_index(drop=True)
 
 
 def compute_em_history(temp_histories: Dict[str, pd.DataFrame], latest: dict, stage_attens_db: Dict[str, float], freq_ghz: float, room_temp_k: float = EM_ROOM_TEMP_DEFAULT_K) -> Dict[str, pd.DataFrame]:
-    temperature_history = build_stage_temperature_history(temp_histories, latest)
+    temperature_history = build_stage_temperature_history(temp_histories)
     if temperature_history.empty:
         return {}
 
@@ -688,21 +699,24 @@ def chip_color(v: Optional[float]) -> str:
 
 def thermal_n(temp_k, freq_ghz: float):
     temp = np.asarray(temp_k, dtype=float)
-    temp = np.maximum(temp, 1e-9)
+    invalid = ~np.isfinite(temp) | (temp <= 0)
+    safe_temp = np.where(invalid, np.nan, np.maximum(temp, 1e-9))
     freq_hz = float(freq_ghz) * 1e9
-    exponent = (H * freq_hz) / (K_B * temp)
+    exponent = (H * freq_hz) / (K_B * safe_temp)
     with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
         n = 1.0 / np.expm1(exponent)
-    return np.where(np.isfinite(n), n, 0.0)
+    return np.where(invalid, np.nan, n)
 
 
 def n_to_teff(n, freq_ghz: float):
-    occupation = np.maximum(np.asarray(n, dtype=float), 1e-20)
+    occupation = np.asarray(n, dtype=float)
+    invalid = ~np.isfinite(occupation) | (occupation < 0)
+    safe_occupation = np.where(invalid, np.nan, np.maximum(occupation, 1e-20))
     freq_hz = float(freq_ghz) * 1e9
     hf_over_k = (H * freq_hz) / K_B
     with np.errstate(divide="ignore", invalid="ignore"):
-        temp = hf_over_k / np.log1p(1.0 / occupation)
-    return np.where(np.isfinite(temp), temp, 0.0)
+        temp = hf_over_k / np.log1p(1.0 / safe_occupation)
+    return np.where(invalid, np.nan, temp)
 
 
 def compute_em_chain(stage_temps: Dict[str, object], stage_attens_db: Dict[str, float], freq_ghz: float, room_temp_k: float = EM_ROOM_TEMP_DEFAULT_K):
@@ -1039,7 +1053,7 @@ def render_dashboard_page():
         total_below_20mk = below_20mk_h
         total_below_20mk_help = f"Reported over the available {hours}-hour window"
 
-    tabs = st.tabs(["Overview", "Temperatures", "Pressures", "Operations", "Effective EM Environment"])
+    tabs = st.tabs(["Overview", "Temperatures", "Pressures", "Effective EM Environment", "Operations"])
 
     with tabs[0]:
         st.markdown("### Current state")
@@ -1209,85 +1223,9 @@ def render_dashboard_page():
         )
 
     with tabs[3]:
-        st.markdown("### Operations summary")
-        st.markdown(
-            '<div class="section-caption">Routine-maintenance indicators from current machine states, runtime counters, and recent history.</div>',
-            unsafe_allow_html=True,
-        )
-
-        row1 = st.columns(4, gap="large")
-        with row1[0]:
-            render_metric_box("Pulse Tube", fmt_state(latest.get("pulse_tube")), "Current machine state")
-        with row1[1]:
-            render_metric_box("Turbo", fmt_state(latest.get("turbo_1")), "Current machine state")
-        with row1[2]:
-            render_metric_box("Scroll 1", fmt_state(latest.get("scroll_1")), "Current machine state")
-        with row1[3]:
-            render_metric_box("Scroll 2", fmt_state(latest.get("scroll_2")), "Current machine state")
-
-        st.write("")
-
-        row2 = st.columns(4, gap="large")
-        with row2[0]:
-            render_metric_box("Pulse Tube Hours", fmt_hours(latest.get("total_hours_pulse_tube")), "Cumulative counter")
-        with row2[1]:
-            render_metric_box("Turbo Hours", fmt_hours(latest.get("total_hours_turbo_1")), "Cumulative counter")
-        with row2[2]:
-            render_metric_box("Scroll 1 Hours", fmt_hours(latest.get("total_hours_scroll_1")), "Cumulative counter")
-        with row2[3]:
-            render_metric_box("Scroll 2 Hours", fmt_hours(latest.get("total_hours_scroll_2")), "Cumulative counter")
-
-        st.write("")
-
-        row3 = st.columns(4, gap="large")
-        with row3[0]:
-            render_metric_box("Pulse Tube Duty", fmt_percent(duty_cycle["pulse_tube"]), f"On-time over the last {hours} h")
-        with row3[1]:
-            render_metric_box("Turbo Duty", fmt_percent(duty_cycle["turbo_1"]), f"On-time over the last {hours} h")
-        with row3[2]:
-            render_metric_box("Scroll 1 Duty", fmt_percent(duty_cycle["scroll_1"]), f"On-time over the last {hours} h")
-        with row3[3]:
-            render_metric_box("Scroll 2 Duty", fmt_percent(duty_cycle["scroll_2"]), f"On-time over the last {hours} h")
-
-        st.write("")
-
-        row4 = st.columns(4, gap="large")
-        with row4[0]:
-            render_metric_box("Pulse Tube Starts (24 h)", fmt_count(coalesce_value(metrics.get("pulse_tube_starts_24h"), state_starts["pulse_tube"])), "Transitions from off to on")
-        with row4[1]:
-            render_metric_box("Turbo Starts (24 h)", fmt_count(coalesce_value(metrics.get("turbo_1_starts_24h"), state_starts["turbo_1"])), "Transitions from off to on")
-        with row4[2]:
-            render_metric_box("Scroll 1 Starts (24 h)", fmt_count(coalesce_value(metrics.get("scroll_1_starts_24h"), state_starts["scroll_1"])), "Transitions from off to on")
-        with row4[3]:
-            render_metric_box("Scroll 2 Starts (24 h)", fmt_count(coalesce_value(metrics.get("scroll_2_starts_24h"), state_starts["scroll_2"])), "Transitions from off to on")
-
-        st.write("")
-
-        fig_state = make_multi_trace_figure(
-            state_hist,
-            title=f"State timeline, last {hours} h",
-            yaxis_title="State",
-            log_y=False,
-            height=500,
-        )
-        fig_state.update_yaxes(range=[-0.1, 1.1], tickvals=[0, 1])
-        st.plotly_chart(
-            fig_state,
-            theme=None,
-            use_container_width=True,
-            config={"displaylogo": False, "responsive": True},
-        )
-
-        st.write("")
-        st.info(
-            f"The most recent database row is timestamped {latest_ts if latest_ts else 'unavailable'}. "
-            "If this drifts far behind wall-clock time, the sync job or the upstream parquet update may be lagging."
-        )
-
-    with tabs[4]:
         st.markdown("### Effective EM Environment")
         st.markdown(
-            '<div class="section-caption">Equivalent microwave line temperature from room temperature through the attenuator chain, using the live BlueFors stage temperatures.</div>',
+            '<div class="section-caption">Effective microwave temperature from room temperature through the attenuator chain, using the live BlueFors stage temperatures.</div>',
             unsafe_allow_html=True,
         )
 
@@ -1365,14 +1303,15 @@ def render_dashboard_page():
                     render_metric_box(
                         PRETTY_NAMES[key],
                         fmt_em_temp(float(np.asarray(em_teff_latest[key]).reshape(-1)[-1])),
-                        f"Equivalent line temperature at {em_freq_ghz:.1f} GHz",
+                        f"Effective temperature at {em_freq_ghz:.1f} GHz",
                     )
 
+            st.write("")
             with st.expander("Model assumptions", expanded=False):
                 st.markdown(
-                    "Each attenuator is treated as a thermalized beam splitter at its local stage temperature. "
-                    "The input line starts at the room-temperature source, and each stage attenuates the incoming occupation "
-                    "before passing the resulting noise forward to the next colder stage."
+                    "This tab uses the same thermal beam-splitter recurrence from the reference code: "
+                    r"$\bar n_{\mathrm{out}} = \bar n_{\mathrm{in}}/L + (1 - 1/L)\bar n(T_i, f)$ with $L = 10^{A_i/10}$. "
+                    "The output occupation of each stage is then converted to an effective temperature by inverting the Bose-Einstein relation."
                 )
 
             if plot_em_history:
@@ -1405,6 +1344,84 @@ def render_dashboard_page():
                     )
                 else:
                     st.info("Effective EM history is unavailable for the selected time window.")
+
+            st.caption("For further reference visit this repo: https://github.com/mvwf/qublitz")
+
+    with tabs[4]:
+        st.markdown("### Operations summary")
+        st.markdown(
+            '<div class="section-caption">Routine-maintenance indicators from current machine states, runtime counters, and recent history.</div>',
+            unsafe_allow_html=True,
+        )
+
+        row1 = st.columns(4, gap="large")
+        with row1[0]:
+            render_metric_box("Pulse Tube", fmt_state(latest.get("pulse_tube")), "Current machine state")
+        with row1[1]:
+            render_metric_box("Turbo", fmt_state(latest.get("turbo_1")), "Current machine state")
+        with row1[2]:
+            render_metric_box("Scroll 1", fmt_state(latest.get("scroll_1")), "Current machine state")
+        with row1[3]:
+            render_metric_box("Scroll 2", fmt_state(latest.get("scroll_2")), "Current machine state")
+
+        st.write("")
+
+        row2 = st.columns(4, gap="large")
+        with row2[0]:
+            render_metric_box("Pulse Tube Hours", fmt_hours(latest.get("total_hours_pulse_tube")), "Cumulative counter")
+        with row2[1]:
+            render_metric_box("Turbo Hours", fmt_hours(latest.get("total_hours_turbo_1")), "Cumulative counter")
+        with row2[2]:
+            render_metric_box("Scroll 1 Hours", fmt_hours(latest.get("total_hours_scroll_1")), "Cumulative counter")
+        with row2[3]:
+            render_metric_box("Scroll 2 Hours", fmt_hours(latest.get("total_hours_scroll_2")), "Cumulative counter")
+
+        st.write("")
+
+        row3 = st.columns(4, gap="large")
+        with row3[0]:
+            render_metric_box("Pulse Tube Duty", fmt_percent(duty_cycle["pulse_tube"]), f"On-time over the last {hours} h")
+        with row3[1]:
+            render_metric_box("Turbo Duty", fmt_percent(duty_cycle["turbo_1"]), f"On-time over the last {hours} h")
+        with row3[2]:
+            render_metric_box("Scroll 1 Duty", fmt_percent(duty_cycle["scroll_1"]), f"On-time over the last {hours} h")
+        with row3[3]:
+            render_metric_box("Scroll 2 Duty", fmt_percent(duty_cycle["scroll_2"]), f"On-time over the last {hours} h")
+
+        st.write("")
+
+        row4 = st.columns(4, gap="large")
+        with row4[0]:
+            render_metric_box("Pulse Tube Starts (24 h)", fmt_count(coalesce_value(metrics.get("pulse_tube_starts_24h"), state_starts["pulse_tube"])), "Transitions from off to on")
+        with row4[1]:
+            render_metric_box("Turbo Starts (24 h)", fmt_count(coalesce_value(metrics.get("turbo_1_starts_24h"), state_starts["turbo_1"])), "Transitions from off to on")
+        with row4[2]:
+            render_metric_box("Scroll 1 Starts (24 h)", fmt_count(coalesce_value(metrics.get("scroll_1_starts_24h"), state_starts["scroll_1"])), "Transitions from off to on")
+        with row4[3]:
+            render_metric_box("Scroll 2 Starts (24 h)", fmt_count(coalesce_value(metrics.get("scroll_2_starts_24h"), state_starts["scroll_2"])), "Transitions from off to on")
+
+        st.write("")
+
+        fig_state = make_multi_trace_figure(
+            state_hist,
+            title=f"State timeline, last {hours} h",
+            yaxis_title="State",
+            log_y=False,
+            height=500,
+        )
+        fig_state.update_yaxes(range=[-0.1, 1.1], tickvals=[0, 1])
+        st.plotly_chart(
+            fig_state,
+            theme=None,
+            use_container_width=True,
+            config={"displaylogo": False, "responsive": True},
+        )
+
+        st.write("")
+        st.info(
+            f"The most recent database row is timestamped {latest_ts if latest_ts else 'unavailable'}. "
+            "If this drifts far behind wall-clock time, the sync job or the upstream parquet update may be lagging."
+        )
 
 
 if auto_refresh_seconds > 0 and hasattr(st, "fragment"):
