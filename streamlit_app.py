@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import math
 from pathlib import Path
+import time
 from typing import Dict, Optional
 
 import numpy as np
@@ -13,8 +14,10 @@ from PIL import Image
 API_BASE = st.secrets["api_base"].rstrip("/")
 API_KEY = st.secrets["api_key"]
 DASHBOARD_PASSWORD = st.secrets["dashboard_password"]
-REQUEST_TIMEOUT_SECONDS = 20
+REQUEST_TIMEOUT_SECONDS = 10
 PLOT_MAX_POINTS = 1200
+FETCH_RETRIES = 1
+FETCH_RETRY_SLEEP_SECONDS = 0.35
 
 st.set_page_config(
     page_title="Cassini BlueFors Dashboard",
@@ -222,12 +225,12 @@ def render_login_page():
             if cassini is not None:
                 st.image(cassini, width=230)
 
-        st.markdown('<div class="login-kicker">FitzLab • Dartmouth Engineering</div>', unsafe_allow_html=True)
+        st.markdown('<div class="login-kicker">Fitz Laboratory • Dartmouth Engineering</div>', unsafe_allow_html=True)
         st.markdown('<div class="login-title">Cassini BlueFors Dashboard</div>', unsafe_allow_html=True)
-        # st.markdown(
-        #     '<div class="login-copy">Watching the Cassini cryostat breathe in real time with live temperatures, pressures, and pump-state telemetry pulled from the BlueFors log stream.</div>',
-        #     unsafe_allow_html=True,
-        # )
+        st.markdown(
+            '<div class="login-copy">Watching the Cassini cryostat breathe in real time with live temperatures, pressures, and pump-state telemetry pulled from the BlueFors log stream.</div>',
+            unsafe_allow_html=True,
+        )
 
         pwd = st.text_input("Password", type="password")
         if st.button("Enter"):
@@ -251,14 +254,23 @@ def empty_history_df() -> pd.DataFrame:
 
 
 def fetch_json(path: str, params: Optional[dict] = None):
-    response = requests.get(
-        f"{API_BASE}{path}",
-        headers=HEADERS,
-        params=params or {},
-        timeout=REQUEST_TIMEOUT_SECONDS,
-    )
-    response.raise_for_status()
-    return response.json()
+    last_error = None
+    for attempt in range(FETCH_RETRIES + 1):
+        try:
+            response = requests.get(
+                f"{API_BASE}{path}",
+                headers=HEADERS,
+                params=params or {},
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt >= FETCH_RETRIES:
+                raise
+            time.sleep(FETCH_RETRY_SLEEP_SECONDS * (attempt + 1))
+    raise last_error
 
 
 def downsample_df(df: pd.DataFrame, max_points: int = PLOT_MAX_POINTS) -> pd.DataFrame:
@@ -283,8 +295,170 @@ def history_payload_to_df(points) -> pd.DataFrame:
     return downsample_df(df)
 
 
+def is_missing(v) -> bool:
+    if v is None:
+        return True
+    try:
+        return bool(pd.isna(v))
+    except Exception:
+        return False
+
+
+def coalesce_value(*values):
+    for value in values:
+        if not is_missing(value):
+            return value
+    return None
+
+
+def latest_history_value(df: pd.DataFrame):
+    if df.empty or "value" not in df:
+        return None
+    values = pd.to_numeric(df["value"], errors="coerce").dropna()
+    if values.empty:
+        return None
+    return float(values.iloc[-1])
+
+
+def latest_history_timestamp(df: pd.DataFrame):
+    if df.empty or "ts_eastern" not in df:
+        return None
+    ts = pd.to_datetime(df["ts_eastern"], errors="coerce").dropna()
+    if ts.empty:
+        return None
+    return ts.iloc[-1].isoformat()
+
+
+def latest_timestamp_from_histories(histories: Dict[str, pd.DataFrame]):
+    timestamps = []
+    for df in histories.values():
+        ts = latest_history_timestamp(df)
+        if ts is not None:
+            timestamps.append(ts)
+    if not timestamps:
+        return None
+    return max(timestamps)
+
+
+def merge_records(primary: dict, fallback: dict) -> dict:
+    merged = dict(fallback or {})
+    for key, value in (primary or {}).items():
+        if not is_missing(value):
+            merged[key] = value
+    return merged
+
+
+def merge_histories(primary: Dict[str, pd.DataFrame], fallback: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+    merged: Dict[str, pd.DataFrame] = {}
+    all_keys = set(fallback or {}).union(primary or {})
+    for key in all_keys:
+        current_df = (primary or {}).get(key)
+        fallback_df = (fallback or {}).get(key)
+        merged[key] = current_df if current_df is not None and not current_df.empty else (fallback_df if fallback_df is not None else empty_history_df())
+    return merged
+
+
+def synthesize_latest_snapshot(latest: dict, metrics: dict, histories: Dict[str, pd.DataFrame], health: Optional[dict] = None) -> dict:
+    snapshot = merge_records(latest, metrics)
+
+    for key in HISTORY_KEYS:
+        snapshot[key] = coalesce_value(
+            snapshot.get(key),
+            latest_history_value(histories.get(key, empty_history_df())),
+        )
+
+    snapshot["ts_eastern"] = coalesce_value(
+        snapshot.get("ts_eastern"),
+        latest_timestamp_from_histories(histories),
+        (health or {}).get("latest_ts_eastern"),
+    )
+    return snapshot
+
+
+def recent_temperature_slope(df: pd.DataFrame, lookback_hours: int = 3) -> Optional[float]:
+    if df.empty or len(df) < 2:
+        return None
+
+    window_end = pd.to_datetime(df["ts_eastern"], errors="coerce").max()
+    if pd.isna(window_end):
+        return None
+
+    window_start = window_end - pd.Timedelta(hours=lookback_hours)
+    recent = df[df["ts_eastern"] >= window_start].copy()
+    if len(recent) < 2:
+        recent = df.tail(min(len(df), 12)).copy()
+    if len(recent) < 2:
+        return None
+
+    recent["ts_eastern"] = pd.to_datetime(recent["ts_eastern"], errors="coerce")
+    recent["value"] = pd.to_numeric(recent["value"], errors="coerce")
+    recent = recent.dropna(subset=["ts_eastern", "value"])
+    if len(recent) < 2:
+        return None
+
+    dt_hours = (recent["ts_eastern"].iloc[-1] - recent["ts_eastern"].iloc[0]).total_seconds() / 3600.0
+    if dt_hours <= 0:
+        return None
+
+    return float((recent["value"].iloc[-1] - recent["value"].iloc[0]) / dt_hours)
+
+
+def fridge_state(latest: dict, histories: Dict[str, pd.DataFrame]) -> tuple[str, str]:
+    mxc = coalesce_value(latest.get("T_MXC"), latest_history_value(histories.get("T_MXC", empty_history_df())))
+    still = coalesce_value(latest.get("T_Still"), latest_history_value(histories.get("T_Still", empty_history_df())))
+    pulse_tube = coalesce_value(latest.get("pulse_tube"), latest_history_value(histories.get("pulse_tube", empty_history_df())))
+    turbo = coalesce_value(latest.get("turbo_1"), latest_history_value(histories.get("turbo_1", empty_history_df())))
+    scroll_1 = coalesce_value(latest.get("scroll_1"), latest_history_value(histories.get("scroll_1", empty_history_df())))
+    scroll_2 = coalesce_value(latest.get("scroll_2"), latest_history_value(histories.get("scroll_2", empty_history_df())))
+    slope = recent_temperature_slope(histories.get("T_MXC", empty_history_df()), lookback_hours=3)
+
+    if is_missing(mxc):
+        return "Unknown", "MXC history unavailable"
+
+    mxc = float(mxc)
+    still_value = None if is_missing(still) else float(still)
+    pumps_on = any(
+        not is_missing(value) and float(value) >= 0.5
+        for value in (pulse_tube, turbo, scroll_1, scroll_2)
+    )
+    slope_threshold = 0.001 if mxc < 0.2 else 0.01
+
+    if mxc < 0.02 and (slope is None or abs(slope) <= slope_threshold):
+        return "Cooled", "MXC is below 20 mK and stable"
+
+    if slope is not None and slope <= -slope_threshold:
+        return "Cooling down", "MXC is trending colder"
+
+    if slope is not None and slope >= slope_threshold:
+        return "Warming up", "MXC is trending warmer"
+
+    if pumps_on and mxc >= 0.02:
+        return "Cooling down", "Cooling hardware is active above base temperature"
+
+    if not pumps_on and (mxc >= 0.02 or (still_value is not None and still_value > 1.0)):
+        return "Warming up", "Cooling hardware is not fully engaged"
+
+    return ("Cooled", "Cryostat is holding near its base temperature") if mxc < 0.05 else ("Cooling down", "Cryostat is settling toward a colder state")
+
+
+def latest_age_minutes(ts_value) -> Optional[float]:
+    ts = pd.to_datetime(ts_value, errors="coerce")
+    if pd.isna(ts):
+        return None
+    now = pd.Timestamp.now().tz_localize(None)
+    if getattr(ts, "tzinfo", None) is not None:
+        ts = ts.tz_convert(None)
+    return float((now - ts).total_seconds() / 60.0)
+
+
 @st.cache_data(show_spinner=False, ttl=20)
 def load_dashboard(hours: int):
+    health = {}
+    try:
+        health = fetch_json("/health")
+    except requests.RequestException:
+        pass
+
     try:
         payload = fetch_json("/dashboard", params={"hours": hours, "max_points": PLOT_MAX_POINTS})
         if isinstance(payload, dict) and "metrics" in payload and "histories" in payload:
@@ -293,15 +467,15 @@ def load_dashboard(hours: int):
                 key: history_payload_to_df(points)
                 for key, points in payload.get("histories", {}).items()
             }
-            return metrics, metrics, histories
+            return metrics, metrics, histories, health
     except requests.RequestException:
         pass
 
     latest = {}
     metrics = {}
-    histories = {}
+    histories = {key: empty_history_df() for key in HISTORY_KEYS}
 
-    with ThreadPoolExecutor(max_workers=min(14, len(HISTORY_KEYS) + 2)) as pool:
+    with ThreadPoolExecutor(max_workers=min(6, len(HISTORY_KEYS) + 3)) as pool:
         futures = {
             pool.submit(fetch_json, "/latest"): ("latest", None),
             pool.submit(fetch_json, "/metrics"): ("metrics", None),
@@ -311,7 +485,10 @@ def load_dashboard(hours: int):
 
         for future in as_completed(futures):
             kind, key = futures[future]
-            payload = future.result()
+            try:
+                payload = future.result()
+            except requests.RequestException:
+                continue
             if kind == "latest":
                 latest = payload or {}
             elif kind == "metrics":
@@ -319,13 +496,15 @@ def load_dashboard(hours: int):
             else:
                 histories[key] = history_payload_to_df(payload.get("points", []))
 
-    return latest, metrics, histories
+    return latest, metrics, histories, health
 
 
-def fmt_temp(v: Optional[float]) -> str:
+def fmt_temp(v: Optional[float], always_mk: bool = False) -> str:
     if v is None or pd.isna(v):
         return "—"
     v = float(v)
+    if always_mk:
+        return f"{v * 1e3:,.1f} mK"
     if abs(v) < 0.1:
         return f"{v * 1e3:.1f} mK"
     if abs(v) < 10:
@@ -408,6 +587,27 @@ def duty_cycle_percent(df: pd.DataFrame) -> Optional[float]:
     if values.empty:
         return None
     return float((values >= 0.5).mean() * 100.0)
+
+
+def count_state_starts(df: pd.DataFrame, lookback_hours: int = 24) -> Optional[int]:
+    if df.empty:
+        return None
+
+    recent = df.copy()
+    recent["ts_eastern"] = pd.to_datetime(recent["ts_eastern"], errors="coerce")
+    recent["value"] = pd.to_numeric(recent["value"], errors="coerce")
+    recent = recent.dropna(subset=["ts_eastern", "value"]).sort_values("ts_eastern")
+    if recent.empty:
+        return None
+
+    cutoff = recent["ts_eastern"].max() - pd.Timedelta(hours=lookback_hours)
+    recent = recent[recent["ts_eastern"] >= cutoff].copy()
+    if len(recent) < 2:
+        return 0
+
+    prev = recent["value"].shift(1).fillna(0.0)
+    starts = ((prev < 0.5) & (recent["value"] >= 0.5)).sum()
+    return int(starts)
 
 
 def time_below_threshold_hours(df: pd.DataFrame, threshold: float) -> float:
@@ -562,16 +762,37 @@ def render_dashboard_page():
     latest = {}
     metrics = {}
     histories = {}
+    health = {}
     stale_snapshot = False
 
     try:
         with st.spinner("Loading live cryostat data..."):
-            latest, metrics, histories = load_dashboard(hours)
-        st.session_state["last_good_dashboard"] = (latest, metrics, histories)
+            latest, metrics, histories, health = load_dashboard(hours)
+
+        cached_dashboard = st.session_state.get("last_good_dashboard")
+        if cached_dashboard is not None:
+            if len(cached_dashboard) == 4:
+                cached_latest, cached_metrics, cached_histories, cached_health = cached_dashboard
+            else:
+                cached_latest, cached_metrics, cached_histories = cached_dashboard
+                cached_health = {}
+            latest = merge_records(latest, cached_latest)
+            metrics = merge_records(metrics, cached_metrics)
+            histories = merge_histories(histories, cached_histories)
+            health = merge_records(health, cached_health)
+
+        latest = synthesize_latest_snapshot(latest, metrics, histories, health)
+        if all(is_missing(latest.get(key)) for key in HISTORY_KEYS):
+            raise RuntimeError("No live telemetry values were returned by the API.")
+        st.session_state["last_good_dashboard"] = (latest, metrics, histories, health)
     except Exception as exc:
         cached_dashboard = st.session_state.get("last_good_dashboard")
         if cached_dashboard is not None:
-            latest, metrics, histories = cached_dashboard
+            if len(cached_dashboard) == 4:
+                latest, metrics, histories, health = cached_dashboard
+            else:
+                latest, metrics, histories = cached_dashboard
+                health = {}
             stale_snapshot = True
             api_error = str(exc)
         else:
@@ -585,15 +806,15 @@ def render_dashboard_page():
     with hero_cols[1]:
         st.markdown('<div class="hero-kicker">Fitz Laboratory • Dartmouth Engineering</div>', unsafe_allow_html=True)
         st.title("Cassini BlueFors Dashboard")
-        # st.markdown(
-        #     '<div class="hero-copy">Live cryostat telemetry, cooldown health, and operations monitoring for the Cassini platform, sourced from the BlueFors logs and served through the FitzLab monitor stack.</div>',
-        #     unsafe_allow_html=True,
-        # )
+        st.markdown(
+            '<div class="hero-copy">Live cryostat telemetry, cooldown health, and operations monitoring for the Cassini platform, sourced from the BlueFors logs and served through the FitzLab monitor stack.</div>',
+            unsafe_allow_html=True,
+        )
         st.markdown(
             f'<div class="hero-meta">Auto-refresh: {format_refresh_label(auto_refresh_seconds)}</div>',
             unsafe_allow_html=True,
         )
-        # st.markdown("[FitzLab Website](https://sites.google.com/view/fitzlab/home)  |  [Main Designer: Juan Salcedo](https://www.linkedin.com/in/jussalcedoga/)")
+        st.markdown("[FitzLab Website](https://sites.google.com/view/fitzlab/home)  |  [Main Designer: Juan Salcedo](https://www.linkedin.com/in/jussalcedoga/)")
     with hero_cols[2]:
         if cassini is not None:
             st.image(cassini, use_container_width=True)
@@ -619,6 +840,10 @@ def render_dashboard_page():
     else:
         st.caption("Last available data point unavailable")
 
+    latest_age = latest_age_minutes(latest_ts)
+    if latest_age is not None and latest_age > 15:
+        st.warning(f"Live data is lagging by about {latest_age:.0f} minutes. The parquet updater or public API may need attention.")
+
     state_bar = "".join(
         [
             status_chip("Pulse Tube", latest.get("pulse_tube")),
@@ -636,6 +861,14 @@ def render_dashboard_page():
 
     mxc_recent = temp_hist["T_MXC"]
     duty_cycle = {key: duty_cycle_percent(state_hist[key]) for key in STATE_KEYS}
+    state_starts = {key: count_state_starts(state_hist[key], lookback_hours=24) for key in STATE_KEYS}
+    fridge_status, fridge_status_help = fridge_state(latest, histories)
+    below_20mk_h = time_below_threshold_hours(mxc_recent, threshold=0.020)
+    total_below_20mk = metrics.get("hours_below_20mK_total")
+    total_below_20mk_help = "Available over the full record"
+    if is_missing(total_below_20mk):
+        total_below_20mk = below_20mk_h
+        total_below_20mk_help = f"Reported over the available {hours}-hour window"
 
     tabs = st.tabs(["Overview", "Temperatures", "Pressures", "Operations"])
 
@@ -648,24 +881,24 @@ def render_dashboard_page():
 
         row1 = st.columns(4, gap="large")
         with row1[0]:
-            render_metric_box("Mixing Chamber", fmt_temp(metrics.get("T_MXC", latest.get("T_MXC"))), "Current MXC temperature")
+            render_metric_box("Mixing Chamber", fmt_temp(latest.get("T_MXC"), always_mk=True), "Current MXC temperature reported in mK")
         with row1[1]:
-            render_metric_box("Still", fmt_temp(metrics.get("T_Still", latest.get("T_Still"))), "Current still temperature")
+            render_metric_box("Still", fmt_temp(latest.get("T_Still"), always_mk=True), "Current still temperature reported in mK")
         with row1[2]:
-            render_metric_box("P1", fmt_pressure(metrics.get("P1", latest.get("P1"))), "Latest pressure gauge P1")
+            render_metric_box("P1", fmt_pressure(latest.get("P1")), "Latest pressure gauge P1")
         with row1[3]:
-            render_metric_box("Flow", fmt_flow(metrics.get("Flow", latest.get("Flow"))), "Latest flow value")
+            render_metric_box("Flow", fmt_flow(latest.get("Flow")), "Latest flow value")
 
         st.write("")
         row2 = st.columns(4, gap="large")
         with row2[0]:
-            render_metric_box("Pulse Tube Hours", fmt_hours(metrics.get("total_hours_pulse_tube")), "Cumulative hardware counter")
+            render_metric_box("Pulse Tube Hours", fmt_hours(latest.get("total_hours_pulse_tube")), "Cumulative hardware counter")
         with row2[1]:
-            render_metric_box("Turbo Hours", fmt_hours(metrics.get("total_hours_turbo_1")), "Cumulative hardware counter")
+            render_metric_box("Turbo Hours", fmt_hours(latest.get("total_hours_turbo_1")), "Cumulative hardware counter")
         with row2[2]:
-            render_metric_box("Scroll 1 Hours", fmt_hours(metrics.get("total_hours_scroll_1")), "Cumulative hardware counter")
+            render_metric_box("Scroll 1 Hours", fmt_hours(latest.get("total_hours_scroll_1")), "Cumulative hardware counter")
         with row2[3]:
-            render_metric_box("Scroll 2 Hours", fmt_hours(metrics.get("total_hours_scroll_2")), "Cumulative hardware counter")
+            render_metric_box("Scroll 2 Hours", fmt_hours(latest.get("total_hours_scroll_2")), "Cumulative hardware counter")
 
         st.write("")
         st.markdown(f"### {hours}-hour summary")
@@ -742,21 +975,23 @@ def render_dashboard_page():
         temp_cols = st.columns(4, gap="large")
         for col, key in zip(temp_cols, TEMPERATURE_KEYS):
             with col:
-                render_metric_box(PRETTY_NAMES[key], fmt_temp(latest.get(key)), "Latest value")
+                render_metric_box(
+                    PRETTY_NAMES[key],
+                    fmt_temp(latest.get(key), always_mk=key in {"T_Still", "T_MXC"}),
+                    "Latest value",
+                )
 
         st.write("")
 
-        below_20mk_h = time_below_threshold_hours(mxc_recent, threshold=0.020)
-        current_cold_streak = metrics.get("hours_below_20mK_current")
         cold_cols = st.columns(4, gap="large")
         with cold_cols[0]:
-            render_metric_box("Time below 20 mK", fmt_hours(below_20mk_h), f"Estimated over the last {hours} h")
+            render_metric_box("Time below 20 mK", fmt_hours(below_20mk_h), f"Reported over the last {hours} h")
         with cold_cols[1]:
-            render_metric_box("Total below 20 mK", fmt_hours(metrics.get("hours_below_20mK_total")), "Estimated over the full record")
+            render_metric_box("Total below 20 mK", fmt_hours(total_below_20mk), total_below_20mk_help)
         with cold_cols[2]:
-            render_metric_box("Current cold streak", fmt_hours(current_cold_streak), "Continuous MXC time below 20 mK")
+            render_metric_box("Fridge state", fridge_status, fridge_status_help)
         with cold_cols[3]:
-            render_metric_box("Latest MXC point", fmt_temp(latest.get("T_MXC")), "Last available point")
+            render_metric_box("Latest MXC point", fmt_temp(latest.get("T_MXC"), always_mk=True), "Last available MXC point")
 
     with tabs[2]:
         st.markdown("### Pressure monitoring")
@@ -823,13 +1058,13 @@ def render_dashboard_page():
 
         row2 = st.columns(4, gap="large")
         with row2[0]:
-            render_metric_box("Pulse Tube Hours", fmt_hours(metrics.get("total_hours_pulse_tube")), "Cumulative counter")
+            render_metric_box("Pulse Tube Hours", fmt_hours(latest.get("total_hours_pulse_tube")), "Cumulative counter")
         with row2[1]:
-            render_metric_box("Turbo Hours", fmt_hours(metrics.get("total_hours_turbo_1")), "Cumulative counter")
+            render_metric_box("Turbo Hours", fmt_hours(latest.get("total_hours_turbo_1")), "Cumulative counter")
         with row2[2]:
-            render_metric_box("Scroll 1 Hours", fmt_hours(metrics.get("total_hours_scroll_1")), "Cumulative counter")
+            render_metric_box("Scroll 1 Hours", fmt_hours(latest.get("total_hours_scroll_1")), "Cumulative counter")
         with row2[3]:
-            render_metric_box("Scroll 2 Hours", fmt_hours(metrics.get("total_hours_scroll_2")), "Cumulative counter")
+            render_metric_box("Scroll 2 Hours", fmt_hours(latest.get("total_hours_scroll_2")), "Cumulative counter")
 
         st.write("")
 
@@ -847,13 +1082,13 @@ def render_dashboard_page():
 
         row4 = st.columns(4, gap="large")
         with row4[0]:
-            render_metric_box("Pulse Tube Starts (24 h)", fmt_count(metrics.get("pulse_tube_starts_24h")), "Transitions from off to on")
+            render_metric_box("Pulse Tube Starts (24 h)", fmt_count(coalesce_value(metrics.get("pulse_tube_starts_24h"), state_starts["pulse_tube"])), "Transitions from off to on")
         with row4[1]:
-            render_metric_box("Turbo Starts (24 h)", fmt_count(metrics.get("turbo_1_starts_24h")), "Transitions from off to on")
+            render_metric_box("Turbo Starts (24 h)", fmt_count(coalesce_value(metrics.get("turbo_1_starts_24h"), state_starts["turbo_1"])), "Transitions from off to on")
         with row4[2]:
-            render_metric_box("Scroll 1 Starts (24 h)", fmt_count(metrics.get("scroll_1_starts_24h")), "Transitions from off to on")
+            render_metric_box("Scroll 1 Starts (24 h)", fmt_count(coalesce_value(metrics.get("scroll_1_starts_24h"), state_starts["scroll_1"])), "Transitions from off to on")
         with row4[3]:
-            render_metric_box("Scroll 2 Starts (24 h)", fmt_count(metrics.get("scroll_2_starts_24h")), "Transitions from off to on")
+            render_metric_box("Scroll 2 Starts (24 h)", fmt_count(coalesce_value(metrics.get("scroll_2_starts_24h"), state_starts["scroll_2"])), "Transitions from off to on")
 
         st.write("")
 
