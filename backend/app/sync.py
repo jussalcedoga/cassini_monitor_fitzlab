@@ -4,11 +4,12 @@ import os
 import json
 import shutil
 import errno
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, List, Tuple
 
-from app.config import WAREHOUSE_ROOT, LOG_DIR, DB_PATH, DB_READONLY_PATH, ensure_dirs
+from app.config import DATA_DIR, WAREHOUSE_ROOT, LOG_DIR, DB_PATH, DB_READONLY_PATH, ensure_dirs
 from app.db import connect
 
 SYNC_LOG = LOG_DIR / "sync.log"
@@ -176,9 +177,34 @@ def refresh_readonly_snapshot() -> None:
     Copy the writable DB to a read-only snapshot after sync finishes.
     Use a temp file + atomic replace so the API never sees a partial file.
     """
-    tmp_path = DB_READONLY_PATH.with_suffix(".tmp")
-    shutil.copy2(DB_PATH, tmp_path)
-    os.replace(tmp_path, DB_READONLY_PATH)
+    ensure_dirs()
+
+    legacy_tmp_path = DB_READONLY_PATH.with_suffix(".tmp")
+    if legacy_tmp_path.exists():
+        try:
+            legacy_tmp_path.unlink()
+            log(f"removed stale legacy snapshot temp file: {legacy_tmp_path}")
+        except Exception as exc:
+            log(f"could not remove legacy snapshot temp file {legacy_tmp_path}: {exc}")
+
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f"{DB_READONLY_PATH.stem}.",
+        suffix=".next",
+        dir=str(DATA_DIR),
+    )
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+
+    try:
+        shutil.copy2(DB_PATH, tmp_path)
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, DB_READONLY_PATH)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
 
 def sync_once() -> dict:
     if not acquire_lock():
@@ -235,18 +261,30 @@ def sync_once() -> dict:
         con.close()
         con = None
 
-        # Refresh the API snapshot only after the writer connection is fully closed
-        refresh_readonly_snapshot()
+        snapshot_status = "ok"
+        snapshot_error = None
+
+        # Refresh the API snapshot only after the writer connection is fully closed.
+        # If publication fails, keep the ingest successful and report the degraded state.
+        try:
+            refresh_readonly_snapshot()
+        except Exception as exc:
+            snapshot_status = "error"
+            snapshot_error = str(exc)
+            log(f"readonly snapshot refresh failed: {exc}")
 
         result = {
-            "status": "ok",
+            "status": "ok" if snapshot_error is None else "degraded_snapshot",
             "files_seen": len(files),
             "files_changed": len(changed),
             "files_synced": files_synced,
             "tracked_files": total_files,
             "rows_total": total_rows,
             "snapshot_path": str(DB_READONLY_PATH),
+            "snapshot_status": snapshot_status,
         }
+        if snapshot_error is not None:
+            result["snapshot_error"] = snapshot_error
         log(json.dumps(result))
         return result
 

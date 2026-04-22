@@ -10,7 +10,7 @@ from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import ALLOWED_KEYS, API_KEY
-from app.db import connect
+from app.db import connect, read_target_status
 
 app = FastAPI(title="Cassini BlueFors API", version="1.0.0")
 
@@ -259,14 +259,14 @@ def health():
         total_rows = con.execute("SELECT COUNT(*) FROM readings").fetchone()[0]
         total_files = con.execute("SELECT COUNT(*) FROM ingested_files").fetchone()[0]
         latest = con.execute("SELECT MAX(ts_eastern) FROM readings").fetchone()[0]
-        return clean_record(
-            {
-                "status": "ok",
-                "rows": total_rows,
-                "files": total_files,
-                "latest_ts_eastern": latest,
-            }
-        )
+        payload = {
+            "status": "ok",
+            "rows": total_rows,
+            "files": total_files,
+            "latest_ts_eastern": latest,
+        }
+        payload.update(read_target_status())
+        return clean_record(payload)
     finally:
         con.close()
 

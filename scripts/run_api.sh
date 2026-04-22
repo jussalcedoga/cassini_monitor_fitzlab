@@ -9,4 +9,4 @@ if [[ -f "$ROOT/backend/.env" ]]; then
 fi
 export PYTHONPATH="$ROOT/backend"
 cd "$ROOT/backend"
-python -m uvicorn app.api:app --host "${API_HOST:-127.0.0.1}" --port "${API_PORT:-8000}"
+python -m uvicorn app.api:app --host "${API_HOST:-127.0.0.1}" --port "${API_PORT:-8001}"

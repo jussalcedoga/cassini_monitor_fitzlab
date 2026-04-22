@@ -16,4 +16,4 @@ else
   exit 1
 fi
 
-exec "$CLOUDFLARED_BIN" tunnel --url "http://${API_HOST:-127.0.0.1}:${API_PORT:-8000}"
+exec "$CLOUDFLARED_BIN" tunnel --url "http://${API_HOST:-127.0.0.1}:${API_PORT:-8001}"

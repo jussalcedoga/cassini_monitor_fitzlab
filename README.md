@@ -11,7 +11,7 @@ A lightweight BlueFors monitoring stack for FitzLab:
 ## Live Links
 
 - Streamlit dashboard: https://cassini-fitzlab.streamlit.app/
-- Current public API base as of April 21, 2026: https://player-some-outside-bureau.trycloudflare.com
+- Current public API base: https://player-some-outside-bureau.trycloudflare.com
 - Public health check: https://player-some-outside-bureau.trycloudflare.com/health
 
 The Cloudflare Quick Tunnel URL changes whenever the API tunnel is restarted. Update your Streamlit secrets whenever that happens.
@@ -19,7 +19,7 @@ The Cloudflare Quick Tunnel URL changes whenever the API tunnel is restarted. Up
 ## What This Repo Includes
 
 - `streamlit_app.py`: root entrypoint for Streamlit Community Cloud
-- `requirements.txt`: root dependency file with a small, Streamlit-friendly pinned set
+- `requirements.txt`: root dependency file with a small, Streamlit-friendly package set
 - `backend/`: the API and sync logic used on the server-side deployment
 - `scripts/`: helper scripts for API startup, sync loops, tmux sessions, and Cloudflare quick tunnels
 - `services/`: `systemd` units for the always-on server setup
@@ -75,15 +75,15 @@ If you want to reproduce the same deployment pattern from raw BlueFors logs, thi
 For a more durable setup, install the provided `systemd` units:
 
 ```bash
-bash scripts/install_systemd.sh
-bash scripts/enable_services.sh
+sudo bash scripts/install_systemd.sh "$USER"
+sudo bash scripts/enable_services.sh
 ```
 
 That gives you:
 
 - `cassini-sync.timer` to keep ingesting fresh BlueFors files
 - `cassini-api.service` to keep FastAPI serving locally
-- `cloudflared-quick.service` as the quick-tunnel recovery path
+- `cloudflared-quick.service` to keep the Cloudflare tunnel alive across restarts
 
 If you prefer tmux instead of services for manual recovery, use:
 
@@ -116,7 +116,9 @@ RUN_SYNC_LOOP=1 bash scripts/start_tmux_stack.sh
 ## Notes
 
 - The sync layer now recovers automatically from stale lock files.
+- The snapshot publisher now rotates through a unique temp file and cleans up the old fixed `cassini_readonly.tmp`, so a stale temp file cannot freeze the public API on last night’s data.
+- If the snapshot copy ever falls behind the writable DuckDB by more than `READONLY_MAX_LAG_SECONDS` (default `180`), the backend code will prefer the fresher live database on the next API restart instead of silently serving stale data.
 - The API launcher and Cloudflare quick tunnel both honor `backend/.env`, including `API_PORT`.
 - The current live deployment is configured for `API_PORT=8001`.
 - The API now exposes a `/dashboard` endpoint so the Streamlit app can fetch metrics and plots in one request when the backend has been restarted onto the updated code.
-- Quick Tunnels are convenient for recovery and demos, but a named Cloudflare Tunnel is the better long-term production path.
+- Quick Tunnels are convenient for recovery and demos, but a named Cloudflare Tunnel is the better long-term production path because the hostname stays fixed across restarts.

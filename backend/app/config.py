@@ -20,7 +20,8 @@ DB_READONLY_PATH = DATA_DIR / "cassini_readonly.duckdb"
 
 API_KEY = os.getenv("API_KEY", "cassini")
 API_HOST = os.getenv("API_HOST", "127.0.0.1")
-API_PORT = int(os.getenv("API_PORT", "8000"))
+API_PORT = int(os.getenv("API_PORT", "8001"))
+READONLY_MAX_LAG_SECONDS = int(os.getenv("READONLY_MAX_LAG_SECONDS", "180"))
 
 ALLOWED_KEYS = {
     "P1","P2","P3","P4","P5","P6",
