@@ -170,20 +170,23 @@ st.markdown(
         opacity: 0.82;
         font-size: 1rem;
         line-height: 1.5;
-        margin-top: -0.2rem;
+        margin-top: 0.15rem;
     }
     .hero-title {
         color: var(--st-text-color, var(--text-color, #0f172a));
         font-size: clamp(2.5rem, 5vw, 4.25rem);
         font-weight: 800;
-        line-height: 1.02;
-        margin: 0 0 0.45rem 0;
+        line-height: 1.08;
+        margin: 0 0 0.65rem 0;
         letter-spacing: -0.03em;
     }
     .hero-meta {
         color: #64748b;
         font-size: 0.88rem;
         margin-top: 0.42rem;
+    }
+    .hero-spacer {
+        height: 0.85rem;
     }
     .refresh-note {
         color: #94a3b8;
@@ -824,6 +827,8 @@ def render_dashboard_page():
     with hero_cols[2]:
         if cassini is not None:
             st.image(cassini, use_container_width=True)
+
+    st.markdown('<div class="hero-spacer"></div>', unsafe_allow_html=True)
 
     if not api_ok:
         st.error("Could not load data from the API.")
