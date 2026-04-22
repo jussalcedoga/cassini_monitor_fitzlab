@@ -222,12 +222,12 @@ def render_login_page():
             if cassini is not None:
                 st.image(cassini, width=230)
 
-        st.markdown('<div class="login-kicker">Fitz Laboratory • Dartmouth Engineering</div>', unsafe_allow_html=True)
+        st.markdown('<div class="login-kicker">FitzLab • Dartmouth Engineering</div>', unsafe_allow_html=True)
         st.markdown('<div class="login-title">Cassini BlueFors Dashboard</div>', unsafe_allow_html=True)
-        st.markdown(
-            '<div class="login-copy">Watching the Cassini cryostat breathe in real time with live temperatures, pressures, and pump-state telemetry pulled from the BlueFors log stream.</div>',
-            unsafe_allow_html=True,
-        )
+        # st.markdown(
+        #     '<div class="login-copy">Watching the Cassini cryostat breathe in real time with live temperatures, pressures, and pump-state telemetry pulled from the BlueFors log stream.</div>',
+        #     unsafe_allow_html=True,
+        # )
 
         pwd = st.text_input("Password", type="password")
         if st.button("Enter"):
@@ -585,15 +585,15 @@ def render_dashboard_page():
     with hero_cols[1]:
         st.markdown('<div class="hero-kicker">Fitz Laboratory • Dartmouth Engineering</div>', unsafe_allow_html=True)
         st.title("Cassini BlueFors Dashboard")
-        st.markdown(
-            '<div class="hero-copy">Live cryostat telemetry, cooldown health, and operations monitoring for the Cassini platform, sourced from the BlueFors logs and served through the FitzLab monitor stack.</div>',
-            unsafe_allow_html=True,
-        )
+        # st.markdown(
+        #     '<div class="hero-copy">Live cryostat telemetry, cooldown health, and operations monitoring for the Cassini platform, sourced from the BlueFors logs and served through the FitzLab monitor stack.</div>',
+        #     unsafe_allow_html=True,
+        # )
         st.markdown(
             f'<div class="hero-meta">Auto-refresh: {format_refresh_label(auto_refresh_seconds)}</div>',
             unsafe_allow_html=True,
         )
-        st.markdown("[FitzLab Website](https://sites.google.com/view/fitzlab/home)  |  [Main Designer: Juan Salcedo](https://www.linkedin.com/in/jussalcedoga/)")
+        # st.markdown("[FitzLab Website](https://sites.google.com/view/fitzlab/home)  |  [Main Designer: Juan Salcedo](https://www.linkedin.com/in/jussalcedoga/)")
     with hero_cols[2]:
         if cassini is not None:
             st.image(cassini, use_container_width=True)
