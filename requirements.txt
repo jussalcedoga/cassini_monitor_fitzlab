@@ -3,3 +3,4 @@ plotly
 pandas
 requests
 numpy
+Pillow

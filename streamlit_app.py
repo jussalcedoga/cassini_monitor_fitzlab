@@ -1,7 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import math
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -28,6 +28,7 @@ APP_DIR = Path(__file__).resolve().parent
 
 DEFAULT_HOURS = 48
 AVAILABLE_WINDOWS = [6, 12, 24, 48, 72]
+AUTO_REFRESH_SECONDS = [0, 30, 60, 120, 300]
 
 TEMPERATURE_KEYS = ["T_50K", "T_4K", "T_Still", "T_MXC"]
 PRESSURE_KEYS = ["P1", "P2", "P3", "P4", "P5", "P6"]
@@ -121,6 +122,59 @@ st.markdown(
         margin-right: 0.42rem;
         margin-bottom: 0.35rem;
     }
+    .login-spacer {
+        height: 3.1rem;
+    }
+    .login-kicker {
+        color: #7dd3fc;
+        font-size: 0.86rem;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        margin-bottom: 0.75rem;
+    }
+    .login-title {
+        color: white;
+        font-size: clamp(2.35rem, 4.6vw, 3.75rem);
+        font-weight: 800;
+        line-height: 1.05;
+        margin-bottom: 0.6rem;
+    }
+    .login-copy {
+        color: #cbd5e1;
+        font-size: 1rem;
+        line-height: 1.55;
+        margin-bottom: 0.95rem;
+    }
+    .login-meta {
+        color: #94a3b8;
+        font-size: 0.92rem;
+        margin-top: 0.7rem;
+    }
+    .hero-kicker {
+        color: #7dd3fc;
+        font-size: 0.84rem;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        margin-bottom: 0.25rem;
+    }
+    .hero-copy {
+        color: #94a3b8;
+        font-size: 1rem;
+        line-height: 1.5;
+        margin-top: -0.2rem;
+    }
+    .hero-meta {
+        color: #64748b;
+        font-size: 0.88rem;
+        margin-top: 0.42rem;
+    }
+    .refresh-note {
+        color: #94a3b8;
+        font-size: 0.92rem;
+        margin-bottom: 0.85rem;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -128,19 +182,6 @@ st.markdown(
 
 if "ok" not in st.session_state:
     st.session_state.ok = False
-
-if not st.session_state.ok:
-    c1, c2, c3 = st.columns([1, 1.2, 1])
-    with c2:
-        st.markdown("## Cassini BlueFors Dashboard")
-        pwd = st.text_input("Password", type="password")
-        if st.button("Enter"):
-            if pwd == DASHBOARD_PASSWORD:
-                st.session_state.ok = True
-                st.rerun()
-            else:
-                st.error("Wrong password")
-    st.stop()
 
 
 def asset_path(name: str) -> Path:
@@ -155,6 +196,54 @@ def safe_image(path: Path):
         return Image.open(path)
     except Exception:
         return None
+
+
+def format_refresh_label(seconds: int) -> str:
+    if seconds == 0:
+        return "Off"
+    if seconds < 60:
+        return f"Every {seconds} s"
+    return f"Every {seconds // 60} min"
+
+
+def render_login_page():
+    logo = safe_image(asset_path("logo.png"))
+    cassini = safe_image(asset_path("cassini.png"))
+
+    c1, c2, c3 = st.columns([0.72, 1.56, 0.72])
+    with c2:
+        st.markdown('<div class="login-spacer"></div>', unsafe_allow_html=True)
+
+        image_cols = st.columns([0.4, 0.6])
+        with image_cols[0]:
+            if logo is not None:
+                st.image(logo, width=180)
+        with image_cols[1]:
+            if cassini is not None:
+                st.image(cassini, width=230)
+
+        st.markdown('<div class="login-kicker">Fitz Laboratory • Dartmouth Engineering</div>', unsafe_allow_html=True)
+        st.markdown('<div class="login-title">Cassini BlueFors Dashboard</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="login-copy">Watching the Cassini cryostat breathe in real time with live temperatures, pressures, and pump-state telemetry pulled from the BlueFors log stream.</div>',
+            unsafe_allow_html=True,
+        )
+
+        pwd = st.text_input("Password", type="password")
+        if st.button("Enter"):
+            if pwd == DASHBOARD_PASSWORD:
+                st.session_state.ok = True
+                st.rerun()
+            else:
+                st.error("Wrong password")
+
+        st.markdown(
+            "[FitzLab Website](https://sites.google.com/view/fitzlab/home)  |  [Main Designer: Juan Salcedo](https://www.linkedin.com/in/jussalcedoga/)"
+        )
+        st.markdown(
+            '<div class="login-meta">Built for FitzLab at Dartmouth. Once you are in, the dashboard can refresh in place so you do not have to log in again just to see the latest point.</div>',
+            unsafe_allow_html=True,
+        )
 
 
 def empty_history_df() -> pd.DataFrame:
@@ -425,6 +514,11 @@ def make_multi_trace_figure(
     return fig
 
 
+if not st.session_state.ok:
+    render_login_page()
+    st.stop()
+
+
 with st.sidebar:
     logo = safe_image(asset_path("logo.png"))
     cassini = safe_image(asset_path("cassini.png"))
@@ -444,303 +538,352 @@ with st.sidebar:
         help="Used for all plots. Default is the last two days.",
     )
 
+    auto_refresh_seconds = st.selectbox(
+        "Auto-refresh",
+        AUTO_REFRESH_SECONDS,
+        index=AUTO_REFRESH_SECONDS.index(60),
+        format_func=format_refresh_label,
+        help="Refreshes the live data in place while this tab stays open, so you can keep watching the latest point without logging in again.",
+    )
+
     st.markdown("---")
+    st.caption("Fitz Laboratory • Dartmouth Engineering")
     st.markdown("### API endpoint")
     st.code(API_BASE, language=None)
+    st.markdown("[FitzLab Website](https://sites.google.com/view/fitzlab/home)")
+    st.markdown("[Main Designer: Juan Salcedo](https://www.linkedin.com/in/jussalcedoga/)")
 
-api_ok = True
-api_error = None
-latest = {}
-metrics = {}
-histories = {}
-stale_snapshot = False
+def render_dashboard_page():
+    logo = safe_image(asset_path("logo.png"))
+    cassini = safe_image(asset_path("cassini.png"))
 
-try:
-    with st.spinner("Loading live cryostat data..."):
-        latest, metrics, histories = load_dashboard(hours)
-    st.session_state["last_good_dashboard"] = (latest, metrics, histories)
-except Exception as exc:
-    cached_dashboard = st.session_state.get("last_good_dashboard")
-    if cached_dashboard is not None:
-        latest, metrics, histories = cached_dashboard
-        stale_snapshot = True
-        api_error = str(exc)
+    api_ok = True
+    api_error = None
+    latest = {}
+    metrics = {}
+    histories = {}
+    stale_snapshot = False
+
+    try:
+        with st.spinner("Loading live cryostat data..."):
+            latest, metrics, histories = load_dashboard(hours)
+        st.session_state["last_good_dashboard"] = (latest, metrics, histories)
+    except Exception as exc:
+        cached_dashboard = st.session_state.get("last_good_dashboard")
+        if cached_dashboard is not None:
+            latest, metrics, histories = cached_dashboard
+            stale_snapshot = True
+            api_error = str(exc)
+        else:
+            api_ok = False
+            api_error = str(exc)
+
+    hero_cols = st.columns([0.18, 0.58, 0.24])
+    with hero_cols[0]:
+        if logo is not None:
+            st.image(logo, width=150)
+    with hero_cols[1]:
+        st.markdown('<div class="hero-kicker">Fitz Laboratory • Dartmouth Engineering</div>', unsafe_allow_html=True)
+        st.title("Cassini BlueFors Dashboard")
+        st.markdown(
+            '<div class="hero-copy">Live cryostat telemetry, cooldown health, and operations monitoring for the Cassini platform, sourced from the BlueFors logs and served through the FitzLab monitor stack.</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f'<div class="hero-meta">Auto-refresh: {format_refresh_label(auto_refresh_seconds)}</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown("[FitzLab Website](https://sites.google.com/view/fitzlab/home)  |  [Main Designer: Juan Salcedo](https://www.linkedin.com/in/jussalcedoga/)")
+    with hero_cols[2]:
+        if cassini is not None:
+            st.image(cassini, use_container_width=True)
+
+    if not api_ok:
+        st.error("Could not load data from the API.")
+        st.code(api_error)
+        st.info("Check that the API, the tunnel, and the secrets are all aligned.")
+        st.stop()
+
+    if auto_refresh_seconds > 0:
+        st.markdown(
+            f'<div class="refresh-note">The dashboard refreshes automatically every {auto_refresh_seconds} seconds while this tab stays open, so you can watch the latest database point without logging in again.</div>',
+            unsafe_allow_html=True,
+        )
+
+    if stale_snapshot:
+        st.warning("Showing the last successful dashboard snapshot because the latest API refresh failed.")
+
+    latest_ts = latest.get("ts_eastern")
+    if latest_ts:
+        st.caption(f"Last available data point in database: {latest_ts}")
     else:
-        api_ok = False
-        api_error = str(exc)
+        st.caption("Last available data point unavailable")
 
-st.title("Cassini BlueFors Dashboard")
+    state_bar = "".join(
+        [
+            status_chip("Pulse Tube", latest.get("pulse_tube")),
+            status_chip("Turbo", latest.get("turbo_1")),
+            status_chip("Scroll 1", latest.get("scroll_1")),
+            status_chip("Scroll 2", latest.get("scroll_2")),
+        ]
+    )
+    st.markdown(state_bar, unsafe_allow_html=True)
 
-if not api_ok:
-    st.error("Could not load data from the API.")
-    st.code(api_error)
-    st.info("Check that the API, the tunnel, and the secrets are all aligned.")
-    st.stop()
+    temp_hist = {key: histories.get(key, empty_history_df()) for key in TEMPERATURE_KEYS}
+    press_hist = {key: histories.get(key, empty_history_df()) for key in PRESSURE_KEYS}
+    flow_hist = {key: histories.get(key, empty_history_df()) for key in FLOW_KEYS}
+    state_hist = {key: histories.get(key, empty_history_df()) for key in STATE_KEYS}
 
-if stale_snapshot:
-    st.warning("Showing the last successful dashboard snapshot because the latest API refresh failed.")
+    mxc_recent = temp_hist["T_MXC"]
+    duty_cycle = {key: duty_cycle_percent(state_hist[key]) for key in STATE_KEYS}
 
-latest_ts = latest.get("ts_eastern")
-if latest_ts:
-    st.caption(f"Last available data point in database: {latest_ts}")
+    tabs = st.tabs(["Overview", "Temperatures", "Pressures", "Operations"])
+
+    with tabs[0]:
+        st.markdown("### Current state")
+        st.markdown(
+            f'<div class="section-caption">Live fridge summary using the latest available database row, followed by recent {hours}-hour trends.</div>',
+            unsafe_allow_html=True,
+        )
+
+        row1 = st.columns(4, gap="large")
+        with row1[0]:
+            render_metric_box("Mixing Chamber", fmt_temp(metrics.get("T_MXC", latest.get("T_MXC"))), "Current MXC temperature")
+        with row1[1]:
+            render_metric_box("Still", fmt_temp(metrics.get("T_Still", latest.get("T_Still"))), "Current still temperature")
+        with row1[2]:
+            render_metric_box("P1", fmt_pressure(metrics.get("P1", latest.get("P1"))), "Latest pressure gauge P1")
+        with row1[3]:
+            render_metric_box("Flow", fmt_flow(metrics.get("Flow", latest.get("Flow"))), "Latest flow value")
+
+        st.write("")
+        row2 = st.columns(4, gap="large")
+        with row2[0]:
+            render_metric_box("Pulse Tube Hours", fmt_hours(metrics.get("total_hours_pulse_tube")), "Cumulative hardware counter")
+        with row2[1]:
+            render_metric_box("Turbo Hours", fmt_hours(metrics.get("total_hours_turbo_1")), "Cumulative hardware counter")
+        with row2[2]:
+            render_metric_box("Scroll 1 Hours", fmt_hours(metrics.get("total_hours_scroll_1")), "Cumulative hardware counter")
+        with row2[3]:
+            render_metric_box("Scroll 2 Hours", fmt_hours(metrics.get("total_hours_scroll_2")), "Cumulative hardware counter")
+
+        st.write("")
+        st.markdown(f"### {hours}-hour summary")
+        st.markdown(
+            '<div class="section-caption">Grouped time-domain plots with thicker traces, readable legends, and explicit time labeling.</div>',
+            unsafe_allow_html=True,
+        )
+
+        temp_scale_overview = st.radio(
+            "Temperature axis scale",
+            ["Linear", "Log"],
+            horizontal=True,
+            key="temp_scale_overview",
+        )
+        fig_temp = make_multi_trace_figure(
+            temp_hist,
+            title=f"Temperature channels, last {hours} h",
+            yaxis_title="Temperature [K]",
+            log_y=temp_scale_overview == "Log",
+            height=540,
+        )
+        st.plotly_chart(
+            fig_temp,
+            theme=None,
+            use_container_width=True,
+            config={"displaylogo": False, "responsive": True},
+        )
+
+        st.write("")
+
+        fig_press = make_multi_trace_figure(
+            press_hist,
+            title=f"Pressure gauges, last {hours} h",
+            yaxis_title="Pressure [arb.]",
+            log_y=True,
+            height=560,
+        )
+        st.plotly_chart(
+            fig_press,
+            theme=None,
+            use_container_width=True,
+            config={"displaylogo": False, "responsive": True},
+        )
+
+    with tabs[1]:
+        st.markdown("### Temperature monitoring")
+        st.markdown(
+            '<div class="section-caption">All cryogenic stages are shown together for direct comparison and fast diagnosis.</div>',
+            unsafe_allow_html=True,
+        )
+
+        temp_scale = st.radio(
+            "Temperature axis scale",
+            ["Linear", "Log"],
+            horizontal=True,
+            key="temp_scale_temperatures",
+        )
+        fig_temp = make_multi_trace_figure(
+            temp_hist,
+            title=f"Temperature channels, last {hours} h",
+            yaxis_title="Temperature [K]",
+            log_y=temp_scale == "Log",
+            height=580,
+        )
+        st.plotly_chart(
+            fig_temp,
+            theme=None,
+            use_container_width=True,
+            config={"displaylogo": False, "responsive": True},
+        )
+
+        st.write("")
+
+        temp_cols = st.columns(4, gap="large")
+        for col, key in zip(temp_cols, TEMPERATURE_KEYS):
+            with col:
+                render_metric_box(PRETTY_NAMES[key], fmt_temp(latest.get(key)), "Latest value")
+
+        st.write("")
+
+        below_20mk_h = time_below_threshold_hours(mxc_recent, threshold=0.020)
+        current_cold_streak = metrics.get("hours_below_20mK_current")
+        cold_cols = st.columns(4, gap="large")
+        with cold_cols[0]:
+            render_metric_box("Time below 20 mK", fmt_hours(below_20mk_h), f"Estimated over the last {hours} h")
+        with cold_cols[1]:
+            render_metric_box("Total below 20 mK", fmt_hours(metrics.get("hours_below_20mK_total")), "Estimated over the full record")
+        with cold_cols[2]:
+            render_metric_box("Current cold streak", fmt_hours(current_cold_streak), "Continuous MXC time below 20 mK")
+        with cold_cols[3]:
+            render_metric_box("Latest MXC point", fmt_temp(latest.get("T_MXC")), "Last available point")
+
+    with tabs[2]:
+        st.markdown("### Pressure monitoring")
+        st.markdown(
+            '<div class="section-caption">All pressure gauges are grouped together with logarithmic scaling for readability across orders of magnitude.</div>',
+            unsafe_allow_html=True,
+        )
+
+        fig_press = make_multi_trace_figure(
+            press_hist,
+            title=f"Pressure gauges, last {hours} h",
+            yaxis_title="Pressure [arb.]",
+            log_y=True,
+            height=600,
+        )
+        st.plotly_chart(
+            fig_press,
+            theme=None,
+            use_container_width=True,
+            config={"displaylogo": False, "responsive": True},
+        )
+
+        st.write("")
+
+        pcols = st.columns(6, gap="small")
+        for col, key in zip(pcols, PRESSURE_KEYS):
+            with col:
+                render_metric_box(key, fmt_pressure(latest.get(key)), "Latest value")
+
+        st.write("")
+
+        fig_flow = make_multi_trace_figure(
+            flow_hist,
+            title=f"Flow, last {hours} h",
+            yaxis_title="Flow",
+            log_y=False,
+            height=450,
+        )
+        st.plotly_chart(
+            fig_flow,
+            theme=None,
+            use_container_width=True,
+            config={"displaylogo": False, "responsive": True},
+        )
+
+    with tabs[3]:
+        st.markdown("### Operations summary")
+        st.markdown(
+            '<div class="section-caption">Routine-maintenance indicators from current machine states, runtime counters, and recent history.</div>',
+            unsafe_allow_html=True,
+        )
+
+        row1 = st.columns(4, gap="large")
+        with row1[0]:
+            render_metric_box("Pulse Tube", fmt_state(latest.get("pulse_tube")), "Current machine state")
+        with row1[1]:
+            render_metric_box("Turbo", fmt_state(latest.get("turbo_1")), "Current machine state")
+        with row1[2]:
+            render_metric_box("Scroll 1", fmt_state(latest.get("scroll_1")), "Current machine state")
+        with row1[3]:
+            render_metric_box("Scroll 2", fmt_state(latest.get("scroll_2")), "Current machine state")
+
+        st.write("")
+
+        row2 = st.columns(4, gap="large")
+        with row2[0]:
+            render_metric_box("Pulse Tube Hours", fmt_hours(metrics.get("total_hours_pulse_tube")), "Cumulative counter")
+        with row2[1]:
+            render_metric_box("Turbo Hours", fmt_hours(metrics.get("total_hours_turbo_1")), "Cumulative counter")
+        with row2[2]:
+            render_metric_box("Scroll 1 Hours", fmt_hours(metrics.get("total_hours_scroll_1")), "Cumulative counter")
+        with row2[3]:
+            render_metric_box("Scroll 2 Hours", fmt_hours(metrics.get("total_hours_scroll_2")), "Cumulative counter")
+
+        st.write("")
+
+        row3 = st.columns(4, gap="large")
+        with row3[0]:
+            render_metric_box("Pulse Tube Duty", fmt_percent(duty_cycle["pulse_tube"]), f"On-time over the last {hours} h")
+        with row3[1]:
+            render_metric_box("Turbo Duty", fmt_percent(duty_cycle["turbo_1"]), f"On-time over the last {hours} h")
+        with row3[2]:
+            render_metric_box("Scroll 1 Duty", fmt_percent(duty_cycle["scroll_1"]), f"On-time over the last {hours} h")
+        with row3[3]:
+            render_metric_box("Scroll 2 Duty", fmt_percent(duty_cycle["scroll_2"]), f"On-time over the last {hours} h")
+
+        st.write("")
+
+        row4 = st.columns(4, gap="large")
+        with row4[0]:
+            render_metric_box("Pulse Tube Starts (24 h)", fmt_count(metrics.get("pulse_tube_starts_24h")), "Transitions from off to on")
+        with row4[1]:
+            render_metric_box("Turbo Starts (24 h)", fmt_count(metrics.get("turbo_1_starts_24h")), "Transitions from off to on")
+        with row4[2]:
+            render_metric_box("Scroll 1 Starts (24 h)", fmt_count(metrics.get("scroll_1_starts_24h")), "Transitions from off to on")
+        with row4[3]:
+            render_metric_box("Scroll 2 Starts (24 h)", fmt_count(metrics.get("scroll_2_starts_24h")), "Transitions from off to on")
+
+        st.write("")
+
+        fig_state = make_multi_trace_figure(
+            state_hist,
+            title=f"State timeline, last {hours} h",
+            yaxis_title="State",
+            log_y=False,
+            height=500,
+        )
+        fig_state.update_yaxes(range=[-0.1, 1.1], tickvals=[0, 1])
+        st.plotly_chart(
+            fig_state,
+            theme=None,
+            use_container_width=True,
+            config={"displaylogo": False, "responsive": True},
+        )
+
+        st.write("")
+        st.info(
+            f"The most recent database row is timestamped {latest_ts if latest_ts else 'unavailable'}. "
+            "If this drifts far behind wall-clock time, the sync job or the upstream parquet update may be lagging."
+        )
+
+
+if auto_refresh_seconds > 0 and hasattr(st, "fragment"):
+    @st.fragment(run_every=f"{auto_refresh_seconds}s")
+    def live_dashboard_fragment():
+        render_dashboard_page()
+
+    live_dashboard_fragment()
 else:
-    st.caption("Last available data point unavailable")
-
-state_bar = "".join(
-    [
-        status_chip("Pulse Tube", latest.get("pulse_tube")),
-        status_chip("Turbo", latest.get("turbo_1")),
-        status_chip("Scroll 1", latest.get("scroll_1")),
-        status_chip("Scroll 2", latest.get("scroll_2")),
-    ]
-)
-st.markdown(state_bar, unsafe_allow_html=True)
-
-temp_hist = {key: histories.get(key, empty_history_df()) for key in TEMPERATURE_KEYS}
-press_hist = {key: histories.get(key, empty_history_df()) for key in PRESSURE_KEYS}
-flow_hist = {key: histories.get(key, empty_history_df()) for key in FLOW_KEYS}
-state_hist = {key: histories.get(key, empty_history_df()) for key in STATE_KEYS}
-
-mxc_recent = temp_hist["T_MXC"]
-duty_cycle = {key: duty_cycle_percent(state_hist[key]) for key in STATE_KEYS}
-
-tabs = st.tabs(["Overview", "Temperatures", "Pressures", "Operations"])
-
-with tabs[0]:
-    st.markdown("### Current state")
-    st.markdown(
-        f'<div class="section-caption">Live fridge summary using the latest available database row, followed by recent {hours}-hour trends.</div>',
-        unsafe_allow_html=True,
-    )
-
-    row1 = st.columns(4, gap="large")
-    with row1[0]:
-        render_metric_box("Mixing Chamber", fmt_temp(metrics.get("T_MXC", latest.get("T_MXC"))), "Current MXC temperature")
-    with row1[1]:
-        render_metric_box("Still", fmt_temp(metrics.get("T_Still", latest.get("T_Still"))), "Current still temperature")
-    with row1[2]:
-        render_metric_box("P1", fmt_pressure(metrics.get("P1", latest.get("P1"))), "Latest pressure gauge P1")
-    with row1[3]:
-        render_metric_box("Flow", fmt_flow(metrics.get("Flow", latest.get("Flow"))), "Latest flow value")
-
-    st.write("")
-    row2 = st.columns(4, gap="large")
-    with row2[0]:
-        render_metric_box("Pulse Tube Hours", fmt_hours(metrics.get("total_hours_pulse_tube")), "Cumulative hardware counter")
-    with row2[1]:
-        render_metric_box("Turbo Hours", fmt_hours(metrics.get("total_hours_turbo_1")), "Cumulative hardware counter")
-    with row2[2]:
-        render_metric_box("Scroll 1 Hours", fmt_hours(metrics.get("total_hours_scroll_1")), "Cumulative hardware counter")
-    with row2[3]:
-        render_metric_box("Scroll 2 Hours", fmt_hours(metrics.get("total_hours_scroll_2")), "Cumulative hardware counter")
-
-    st.write("")
-    st.markdown(f"### {hours}-hour summary")
-    st.markdown(
-        '<div class="section-caption">Grouped time-domain plots with thicker traces, readable legends, and explicit time labeling.</div>',
-        unsafe_allow_html=True,
-    )
-
-    temp_scale_overview = st.radio(
-        "Temperature axis scale",
-        ["Linear", "Log"],
-        horizontal=True,
-        key="temp_scale_overview",
-    )
-    fig_temp = make_multi_trace_figure(
-        temp_hist,
-        title=f"Temperature channels, last {hours} h",
-        yaxis_title="Temperature [K]",
-        log_y=temp_scale_overview == "Log",
-        height=540,
-    )
-    st.plotly_chart(
-        fig_temp,
-        theme=None,
-        use_container_width=True,
-        config={"displaylogo": False, "responsive": True},
-    )
-
-    st.write("")
-
-    fig_press = make_multi_trace_figure(
-        press_hist,
-        title=f"Pressure gauges, last {hours} h",
-        yaxis_title="Pressure [arb.]",
-        log_y=True,
-        height=560,
-    )
-    st.plotly_chart(
-        fig_press,
-        theme=None,
-        use_container_width=True,
-        config={"displaylogo": False, "responsive": True},
-    )
-
-with tabs[1]:
-    st.markdown("### Temperature monitoring")
-    st.markdown(
-        '<div class="section-caption">All cryogenic stages are shown together for direct comparison and fast diagnosis.</div>',
-        unsafe_allow_html=True,
-    )
-
-    temp_scale = st.radio(
-        "Temperature axis scale",
-        ["Linear", "Log"],
-        horizontal=True,
-        key="temp_scale_temperatures",
-    )
-    fig_temp = make_multi_trace_figure(
-        temp_hist,
-        title=f"Temperature channels, last {hours} h",
-        yaxis_title="Temperature [K]",
-        log_y=temp_scale == "Log",
-        height=580,
-    )
-    st.plotly_chart(
-        fig_temp,
-        theme=None,
-        use_container_width=True,
-        config={"displaylogo": False, "responsive": True},
-    )
-
-    st.write("")
-
-    temp_cols = st.columns(4, gap="large")
-    for col, key in zip(temp_cols, TEMPERATURE_KEYS):
-        with col:
-            render_metric_box(PRETTY_NAMES[key], fmt_temp(latest.get(key)), "Latest value")
-
-    st.write("")
-
-    below_20mk_h = time_below_threshold_hours(mxc_recent, threshold=0.020)
-    current_cold_streak = metrics.get("hours_below_20mK_current")
-    cold_cols = st.columns(4, gap="large")
-    with cold_cols[0]:
-        render_metric_box("Time below 20 mK", fmt_hours(below_20mk_h), f"Estimated over the last {hours} h")
-    with cold_cols[1]:
-        render_metric_box("Total below 20 mK", fmt_hours(metrics.get("hours_below_20mK_total")), "Estimated over the full record")
-    with cold_cols[2]:
-        render_metric_box("Current cold streak", fmt_hours(current_cold_streak), "Continuous MXC time below 20 mK")
-    with cold_cols[3]:
-        render_metric_box("Latest MXC point", fmt_temp(latest.get("T_MXC")), "Last available point")
-
-with tabs[2]:
-    st.markdown("### Pressure monitoring")
-    st.markdown(
-        '<div class="section-caption">All pressure gauges are grouped together with logarithmic scaling for readability across orders of magnitude.</div>',
-        unsafe_allow_html=True,
-    )
-
-    fig_press = make_multi_trace_figure(
-        press_hist,
-        title=f"Pressure gauges, last {hours} h",
-        yaxis_title="Pressure [arb.]",
-        log_y=True,
-        height=600,
-    )
-    st.plotly_chart(
-        fig_press,
-        theme=None,
-        use_container_width=True,
-        config={"displaylogo": False, "responsive": True},
-    )
-
-    st.write("")
-
-    pcols = st.columns(6, gap="small")
-    for col, key in zip(pcols, PRESSURE_KEYS):
-        with col:
-            render_metric_box(key, fmt_pressure(latest.get(key)), "Latest value")
-
-    st.write("")
-
-    fig_flow = make_multi_trace_figure(
-        flow_hist,
-        title=f"Flow, last {hours} h",
-        yaxis_title="Flow",
-        log_y=False,
-        height=450,
-    )
-    st.plotly_chart(
-        fig_flow,
-        theme=None,
-        use_container_width=True,
-        config={"displaylogo": False, "responsive": True},
-    )
-
-with tabs[3]:
-    st.markdown("### Operations summary")
-    st.markdown(
-        '<div class="section-caption">Routine-maintenance indicators from current machine states, runtime counters, and recent history.</div>',
-        unsafe_allow_html=True,
-    )
-
-    row1 = st.columns(4, gap="large")
-    with row1[0]:
-        render_metric_box("Pulse Tube", fmt_state(latest.get("pulse_tube")), "Current machine state")
-    with row1[1]:
-        render_metric_box("Turbo", fmt_state(latest.get("turbo_1")), "Current machine state")
-    with row1[2]:
-        render_metric_box("Scroll 1", fmt_state(latest.get("scroll_1")), "Current machine state")
-    with row1[3]:
-        render_metric_box("Scroll 2", fmt_state(latest.get("scroll_2")), "Current machine state")
-
-    st.write("")
-
-    row2 = st.columns(4, gap="large")
-    with row2[0]:
-        render_metric_box("Pulse Tube Hours", fmt_hours(metrics.get("total_hours_pulse_tube")), "Cumulative counter")
-    with row2[1]:
-        render_metric_box("Turbo Hours", fmt_hours(metrics.get("total_hours_turbo_1")), "Cumulative counter")
-    with row2[2]:
-        render_metric_box("Scroll 1 Hours", fmt_hours(metrics.get("total_hours_scroll_1")), "Cumulative counter")
-    with row2[3]:
-        render_metric_box("Scroll 2 Hours", fmt_hours(metrics.get("total_hours_scroll_2")), "Cumulative counter")
-
-    st.write("")
-
-    row3 = st.columns(4, gap="large")
-    with row3[0]:
-        render_metric_box("Pulse Tube Duty", fmt_percent(duty_cycle["pulse_tube"]), f"On-time over the last {hours} h")
-    with row3[1]:
-        render_metric_box("Turbo Duty", fmt_percent(duty_cycle["turbo_1"]), f"On-time over the last {hours} h")
-    with row3[2]:
-        render_metric_box("Scroll 1 Duty", fmt_percent(duty_cycle["scroll_1"]), f"On-time over the last {hours} h")
-    with row3[3]:
-        render_metric_box("Scroll 2 Duty", fmt_percent(duty_cycle["scroll_2"]), f"On-time over the last {hours} h")
-
-    st.write("")
-
-    row4 = st.columns(4, gap="large")
-    with row4[0]:
-        render_metric_box("Pulse Tube Starts (24 h)", fmt_count(metrics.get("pulse_tube_starts_24h")), "Transitions from off to on")
-    with row4[1]:
-        render_metric_box("Turbo Starts (24 h)", fmt_count(metrics.get("turbo_1_starts_24h")), "Transitions from off to on")
-    with row4[2]:
-        render_metric_box("Scroll 1 Starts (24 h)", fmt_count(metrics.get("scroll_1_starts_24h")), "Transitions from off to on")
-    with row4[3]:
-        render_metric_box("Scroll 2 Starts (24 h)", fmt_count(metrics.get("scroll_2_starts_24h")), "Transitions from off to on")
-
-    st.write("")
-
-    fig_state = make_multi_trace_figure(
-        state_hist,
-        title=f"State timeline, last {hours} h",
-        yaxis_title="State",
-        log_y=False,
-        height=500,
-    )
-    fig_state.update_yaxes(range=[-0.1, 1.1], tickvals=[0, 1])
-    st.plotly_chart(
-        fig_state,
-        theme=None,
-        use_container_width=True,
-        config={"displaylogo": False, "responsive": True},
-    )
-
-    st.write("")
-    st.info(
-        f"The most recent database row is timestamped {latest_ts if latest_ts else 'unavailable'}. "
-        "If this drifts far behind wall-clock time, the sync job or the upstream parquet update may be lagging."
-    )
+    render_dashboard_page()
