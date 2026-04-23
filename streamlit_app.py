@@ -50,6 +50,13 @@ EM_ROOM_TEMP_DEFAULT_K = 300.0
 EM_DEFAULT_FREQ_GHZ = 5.0
 K_B = 1.380649e-23
 H = 6.62607015e-34
+MXC_BASE_TARGET_K = 0.010
+MXC_BASE_BAND_K = 0.005
+MXC_SENSOR_FLOOR_TRIGGER_K = 0.009
+MXC_SENSOR_FLOOR_LOOKBACK_H = 3.0
+MXC_BASE_TREND_TOL_KPH = 0.004
+MXC_COLD_TREND_KPH = 0.006
+MXC_WARM_TREND_KPH = 0.006
 
 PRETTY_NAMES = {
     "T_50K": "50 K Stage",
@@ -107,6 +114,35 @@ st.markdown(
         border-radius: 18px;
         padding: 1rem 1rem 0.9rem 1rem;
         min-height: 115px;
+    }
+    .metric-card--base {
+        border-color: rgba(34, 197, 94, 0.34);
+        box-shadow: inset 0 0 0 1px rgba(34, 197, 94, 0.10);
+    }
+    .metric-card--base .metric-value {
+        color: #dcfce7;
+    }
+    .metric-card--cooling {
+        border-color: rgba(59, 130, 246, 0.34);
+        box-shadow: inset 0 0 0 1px rgba(59, 130, 246, 0.10);
+    }
+    .metric-card--cooling .metric-value {
+        color: #dbeafe;
+    }
+    .metric-card--warming {
+        border-color: rgba(249, 115, 22, 0.34);
+        box-shadow: inset 0 0 0 1px rgba(249, 115, 22, 0.10);
+    }
+    .metric-card--warming .metric-value {
+        color: #fed7aa;
+    }
+    .metric-card--sensor-floor {
+        background: linear-gradient(180deg, rgba(8,47,73,0.98), rgba(15,23,42,0.94));
+        border-color: rgba(125, 211, 252, 0.42);
+        box-shadow: inset 0 0 0 1px rgba(125, 211, 252, 0.14);
+    }
+    .metric-card--sensor-floor .metric-value {
+        color: #7dd3fc;
     }
     .metric-title {
         color: #94a3b8;
@@ -384,12 +420,23 @@ def coalesce_value(*values):
 
 
 def latest_history_value(df: pd.DataFrame):
+    value, _ = latest_valid_history_point(df)
+    return value
+
+
+def latest_valid_history_point(df: pd.DataFrame):
     if df.empty or "value" not in df:
-        return None
-    values = pd.to_numeric(df["value"], errors="coerce").dropna()
-    if values.empty:
-        return None
-    return float(values.iloc[-1])
+        return None, pd.NaT
+
+    history = df.copy()
+    history["ts_eastern"] = pd.to_datetime(history["ts_eastern"], errors="coerce")
+    history["value"] = pd.to_numeric(history["value"], errors="coerce")
+    history = history.dropna(subset=["ts_eastern", "value"]).sort_values("ts_eastern")
+    if history.empty:
+        return None, pd.NaT
+
+    last_row = history.iloc[-1]
+    return float(last_row["value"]), last_row["ts_eastern"]
 
 
 def latest_history_timestamp(df: pd.DataFrame):
@@ -417,8 +464,8 @@ def freshest_value(latest: dict, histories: Dict[str, pd.DataFrame], key: str):
     snapshot_ts = pd.to_datetime(latest.get("ts_eastern"), errors="coerce")
 
     history_df = histories.get(key, empty_history_df())
-    history_value = latest_history_value(history_df)
-    history_ts = pd.to_datetime(latest_history_timestamp(history_df), errors="coerce")
+    history_value, history_ts = latest_valid_history_point(history_df)
+    history_ts = pd.to_datetime(history_ts, errors="coerce")
 
     if not is_missing(history_value) and (pd.isna(snapshot_ts) or (not pd.isna(history_ts) and history_ts >= snapshot_ts)):
         return history_value
@@ -543,42 +590,65 @@ def recent_temperature_slope(df: pd.DataFrame, lookback_hours: int = 3) -> Optio
     return float((recent["value"].iloc[-1] - recent["value"].iloc[0]) / dt_hours)
 
 
-def fridge_state(latest: dict, histories: Dict[str, pd.DataFrame]) -> tuple[str, str]:
-    mxc = coalesce_value(latest.get("T_MXC"), latest_history_value(histories.get("T_MXC", empty_history_df())))
-    still = coalesce_value(latest.get("T_Still"), latest_history_value(histories.get("T_Still", empty_history_df())))
-    pulse_tube = coalesce_value(latest.get("pulse_tube"), latest_history_value(histories.get("pulse_tube", empty_history_df())))
-    turbo = coalesce_value(latest.get("turbo_1"), latest_history_value(histories.get("turbo_1", empty_history_df())))
-    scroll_1 = coalesce_value(latest.get("scroll_1"), latest_history_value(histories.get("scroll_1", empty_history_df())))
-    scroll_2 = coalesce_value(latest.get("scroll_2"), latest_history_value(histories.get("scroll_2", empty_history_df())))
-    slope = recent_temperature_slope(histories.get("T_MXC", empty_history_df()), lookback_hours=3)
+def fridge_state(latest: dict, histories: Dict[str, pd.DataFrame]) -> tuple[str, str, str]:
+    mxc_history = histories.get("T_MXC", empty_history_df())
+    mxc = freshest_value(latest, histories, "T_MXC")
+    still = freshest_value(latest, histories, "T_Still")
+    pulse_tube = freshest_value(latest, histories, "pulse_tube")
+    turbo = freshest_value(latest, histories, "turbo_1")
+    scroll_1 = freshest_value(latest, histories, "scroll_1")
+    scroll_2 = freshest_value(latest, histories, "scroll_2")
+    slope = recent_temperature_slope(mxc_history, lookback_hours=3)
+    last_valid_mxc, last_valid_mxc_ts = latest_valid_history_point(mxc_history)
 
-    if is_missing(mxc):
-        return "Unknown", "MXC history unavailable"
+    snapshot_ts = pd.to_datetime(latest.get("ts_eastern"), errors="coerce")
+    history_ts = pd.to_datetime(latest_timestamp_from_histories(histories), errors="coerce")
+    valid_timestamps = [ts for ts in (snapshot_ts, history_ts) if not pd.isna(ts)]
+    current_ts = max(valid_timestamps) if valid_timestamps else pd.NaT
 
-    mxc = float(mxc)
     still_value = None if is_missing(still) else float(still)
     pumps_on = any(
         not is_missing(value) and float(value) >= 0.5
         for value in (pulse_tube, turbo, scroll_1, scroll_2)
     )
-    slope_threshold = 0.001 if mxc < 0.2 else 0.01
 
-    if mxc < 0.02 and (slope is None or abs(slope) <= slope_threshold):
-        return "Cooled", "MXC is below 20 mK and stable"
+    if is_missing(mxc):
+        if not is_missing(last_valid_mxc) and not pd.isna(last_valid_mxc_ts) and not pd.isna(current_ts):
+            age_h = max(0.0, (current_ts - last_valid_mxc_ts).total_seconds() / 3600.0)
+            if age_h <= MXC_SENSOR_FLOOR_LOOKBACK_H and float(last_valid_mxc) <= MXC_SENSOR_FLOOR_TRIGGER_K and pumps_on:
+                return (
+                    "Below sensor range",
+                    f"Last valid MXC point was {fmt_temp(last_valid_mxc, always_mk=True)}; the fridge appears colder than the readable sensor floor.",
+                    "sensor-floor",
+                )
+        return "Unknown", "MXC reading unavailable.", "default"
 
-    if slope is not None and slope <= -slope_threshold:
-        return "Cooling down", "MXC is trending colder"
+    mxc = float(mxc)
+    warm_threshold = MXC_WARM_TREND_KPH if mxc < 0.05 else 0.01
+    cool_threshold = MXC_COLD_TREND_KPH if mxc < 0.05 else 0.01
+    in_base_band = mxc <= MXC_BASE_TARGET_K or (
+        mxc <= MXC_BASE_TARGET_K + MXC_BASE_BAND_K and (slope is None or abs(slope) <= MXC_BASE_TREND_TOL_KPH)
+    )
 
-    if slope is not None and slope >= slope_threshold:
-        return "Warming up", "MXC is trending warmer"
+    if slope is not None and slope >= warm_threshold:
+        return "Warming up", "MXC is trending warmer.", "warming"
 
-    if pumps_on and mxc >= 0.02:
-        return "Cooling down", "Cooling hardware is active above base temperature"
+    if in_base_band:
+        return "At base", f"MXC is at {fmt_temp(mxc, always_mk=True)} and within the base-temperature band.", "base"
+
+    if slope is not None and slope <= -cool_threshold:
+        return "Cooling down", "MXC is still trending colder.", "cooling"
 
     if not pumps_on and (mxc >= 0.02 or (still_value is not None and still_value > 1.0)):
-        return "Warming up", "Cooling hardware is not fully engaged"
+        return "Warming up", "Cooling hardware is not fully engaged.", "warming"
 
-    return ("Cooled", "Cryostat is holding near its base temperature") if mxc < 0.05 else ("Cooling down", "Cryostat is settling toward a colder state")
+    if pumps_on and mxc >= 0.02:
+        return "Cooling down", "Cooling hardware is active above base temperature.", "cooling"
+
+    if mxc < 0.02:
+        return "At base", "Cryostat is holding near its base temperature.", "base"
+
+    return "Cooling down", "Cryostat is settling toward a colder state.", "cooling"
 
 
 @st.cache_data(show_spinner=False, ttl=20)
@@ -749,10 +819,12 @@ def compute_em_chain(stage_temps: Dict[str, object], stage_attens_db: Dict[str, 
     return n_eff, t_eff
 
 
-def render_metric_box(title: str, value: str, help_text: str = ""):
+def render_metric_box(title: str, value: str, help_text: str = "", tone: str = "default"):
+    allowed_tones = {"default", "base", "cooling", "warming", "sensor-floor"}
+    tone_class = f" metric-card--{tone}" if tone in allowed_tones and tone != "default" else ""
     st.markdown(
         f"""
-        <div class="metric-card">
+        <div class="metric-card{tone_class}">
             <div class="metric-title">{title}</div>
             <div class="metric-value">{value}</div>
             <div class="metric-help">{help_text}</div>
@@ -1052,7 +1124,7 @@ def render_dashboard_page():
     mxc_recent = temp_hist["T_MXC"]
     duty_cycle = {key: duty_cycle_percent(state_hist[key]) for key in STATE_KEYS}
     state_starts = {key: count_state_starts(state_hist[key], lookback_hours=24) for key in STATE_KEYS}
-    fridge_status, fridge_status_help = fridge_state(latest, histories)
+    fridge_status, fridge_status_help, fridge_status_tone = fridge_state(latest, histories)
     below_20mk_h = time_below_threshold_hours(mxc_recent, threshold=0.020)
     total_below_20mk = metrics.get("hours_below_20mK_total")
     total_below_20mk_help = "Available over the full record"
@@ -1075,7 +1147,7 @@ def render_dashboard_page():
         with row1[1]:
             render_metric_box("Still", fmt_temp(latest.get("T_Still"), always_mk=True), "Current still temperature")
         with row1[2]:
-            render_metric_box("Fridge state", fridge_status, fridge_status_help)
+            render_metric_box("Fridge state", fridge_status, fridge_status_help, tone=fridge_status_tone)
         with row1[3]:
             render_metric_box("P1", fmt_pressure(latest.get("P1")), f"Latest pressure gauge P1 [{PRESSURE_UNIT}]")
         with row1[4]:
@@ -1181,7 +1253,7 @@ def render_dashboard_page():
         with cold_cols[1]:
             render_metric_box("Total below 20 mK", fmt_hours(total_below_20mk), total_below_20mk_help)
         with cold_cols[2]:
-            render_metric_box("Fridge state", fridge_status, fridge_status_help)
+            render_metric_box("Fridge state", fridge_status, fridge_status_help, tone=fridge_status_tone)
         with cold_cols[3]:
             render_metric_box("Latest MXC point", fmt_temp(latest.get("T_MXC"), always_mk=True), "Last available MXC point")
 
