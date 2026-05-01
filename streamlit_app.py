@@ -1156,13 +1156,13 @@ def render_dashboard_page():
         st.write("")
         row2 = st.columns(4, gap="large")
         with row2[0]:
-            render_metric_box("Pulse Tube Hours", fmt_hours(latest.get("total_hours_pulse_tube")), "Cumulative hardware counter")
+            render_metric_box("Pulse Tube Hours", fmt_hours(latest.get("total_hours_pulse_tube")), "Integrated from BlueFors state log")
         with row2[1]:
-            render_metric_box("Turbo Hours", fmt_hours(latest.get("total_hours_turbo_1")), "Cumulative hardware counter")
+            render_metric_box("Turbo Hours", fmt_hours(latest.get("total_hours_turbo_1")), "Integrated from BlueFors state log")
         with row2[2]:
-            render_metric_box("Scroll 1 Hours", fmt_hours(latest.get("total_hours_scroll_1")), "Cumulative hardware counter")
+            render_metric_box("Scroll 1 Hours", fmt_hours(latest.get("total_hours_scroll_1")), "Integrated from BlueFors state log")
         with row2[3]:
-            render_metric_box("Scroll 2 Hours", fmt_hours(latest.get("total_hours_scroll_2")), "Cumulative hardware counter")
+            render_metric_box("Scroll 2 Hours", fmt_hours(latest.get("total_hours_scroll_2")), "Integrated from BlueFors state log")
 
         st.write("")
         st.markdown(f"### {hours}-hour summary")
@@ -1451,13 +1451,13 @@ def render_dashboard_page():
 
         row2 = st.columns(4, gap="large")
         with row2[0]:
-            render_metric_box("Pulse Tube Hours", fmt_hours(latest.get("total_hours_pulse_tube")), "Cumulative counter")
+            render_metric_box("Pulse Tube Hours", fmt_hours(latest.get("total_hours_pulse_tube")), "Integrated from BlueFors state log")
         with row2[1]:
-            render_metric_box("Turbo Hours", fmt_hours(latest.get("total_hours_turbo_1")), "Cumulative counter")
+            render_metric_box("Turbo Hours", fmt_hours(latest.get("total_hours_turbo_1")), "Integrated from BlueFors state log")
         with row2[2]:
-            render_metric_box("Scroll 1 Hours", fmt_hours(latest.get("total_hours_scroll_1")), "Cumulative counter")
+            render_metric_box("Scroll 1 Hours", fmt_hours(latest.get("total_hours_scroll_1")), "Integrated from BlueFors state log")
         with row2[3]:
-            render_metric_box("Scroll 2 Hours", fmt_hours(latest.get("total_hours_scroll_2")), "Cumulative counter")
+            render_metric_box("Scroll 2 Hours", fmt_hours(latest.get("total_hours_scroll_2")), "Integrated from BlueFors state log")
 
         st.write("")
 
@@ -1503,7 +1503,7 @@ def render_dashboard_page():
         st.write("")
         st.info(
             f"The most recent database row is timestamped {latest_ts if latest_ts else 'unavailable'}. "
-            "If this drifts far behind wall-clock time, the sync job or the upstream parquet update may be lagging."
+            "If this drifts far behind wall-clock time, the local BlueFors log sync on the backend host may be lagging."
         )
 
 

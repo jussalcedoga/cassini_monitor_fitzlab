@@ -1,16 +1,17 @@
-from pathlib import Path
 import os
+from pathlib import Path
+
 from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(PROJECT_ROOT / ".env")
 
-WAREHOUSE_ROOT = Path(
+LOGS_ROOT = Path(
     os.getenv(
-        "WAREHOUSE_ROOT",
-        "/jumbo/fitzlab/code/BlueFors Log DB/data/warehouse/readings",
+        "BLUEFORS_LOGS_ROOT",
+        os.getenv("WAREHOUSE_ROOT", "C:/Users/Fitzlab/Bluefors logs"),
     )
-)
+).expanduser()
 
 DATA_DIR = PROJECT_ROOT / "data"
 LOG_DIR = PROJECT_ROOT / "logs"

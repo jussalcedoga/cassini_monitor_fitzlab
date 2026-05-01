@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 API_SESSION="${API_SESSION:-cassini-api}"
 TUNNEL_SESSION="${TUNNEL_SESSION:-cassini-cloudflare}"
-RUN_SYNC_LOOP="${RUN_SYNC_LOOP:-0}"
+RUN_SYNC_LOOP="${RUN_SYNC_LOOP:-1}"
 SYNC_SESSION="${SYNC_SESSION:-cassini-sync}"
 
 start_session() {
@@ -19,7 +19,7 @@ start_session() {
 }
 
 start_session "$API_SESSION" "bash scripts/run_api.sh"
-start_session "$TUNNEL_SESSION" "bash scripts/run_cloudflared_quick.sh"
+start_session "$TUNNEL_SESSION" "bash scripts/run_cloudflare_tunnel.sh"
 
 if [[ "$RUN_SYNC_LOOP" == "1" ]]; then
   start_session "$SYNC_SESSION" "bash scripts/run_sync_loop.sh"

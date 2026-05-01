@@ -111,6 +111,48 @@ def to_history_records(df: pd.DataFrame, key: str) -> list[dict[str, Any]]:
     return [clean_record(r) for r in series_df.to_dict(orient="records")]
 
 
+def runtime_counters(con) -> dict[str, Any]:
+    df = con.execute(
+        """
+        WITH deltas AS (
+            SELECT
+                ts_eastern,
+                CASE
+                    WHEN LAG(ts_eastern) OVER (ORDER BY ts_eastern) IS NOT NULL AND COALESCE(scroll_1, 0) >= 0.5
+                    THEN epoch(ts_eastern) - epoch(LAG(ts_eastern) OVER (ORDER BY ts_eastern))
+                    ELSE 0
+                END AS scroll_1_seconds,
+                CASE
+                    WHEN LAG(ts_eastern) OVER (ORDER BY ts_eastern) IS NOT NULL AND COALESCE(scroll_2, 0) >= 0.5
+                    THEN epoch(ts_eastern) - epoch(LAG(ts_eastern) OVER (ORDER BY ts_eastern))
+                    ELSE 0
+                END AS scroll_2_seconds,
+                CASE
+                    WHEN LAG(ts_eastern) OVER (ORDER BY ts_eastern) IS NOT NULL AND COALESCE(turbo_1, 0) >= 0.5
+                    THEN epoch(ts_eastern) - epoch(LAG(ts_eastern) OVER (ORDER BY ts_eastern))
+                    ELSE 0
+                END AS turbo_1_seconds,
+                CASE
+                    WHEN LAG(ts_eastern) OVER (ORDER BY ts_eastern) IS NOT NULL AND COALESCE(pulse_tube, 0) >= 0.5
+                    THEN epoch(ts_eastern) - epoch(LAG(ts_eastern) OVER (ORDER BY ts_eastern))
+                    ELSE 0
+                END AS pulse_tube_seconds
+            FROM readings
+        )
+        SELECT
+            SUM(scroll_1_seconds) / 3600.0 AS total_hours_scroll_1,
+            SUM(scroll_2_seconds) / 3600.0 AS total_hours_scroll_2,
+            SUM(turbo_1_seconds) / 3600.0 AS total_hours_turbo_1,
+            SUM(pulse_tube_seconds) / 3600.0 AS total_hours_pulse_tube
+        FROM deltas
+        """
+    ).fetchdf()
+
+    if df.empty:
+        return {}
+    return clean_record(df.iloc[0].to_dict())
+
+
 def metrics_payload(con) -> dict[str, Any]:
     latest_df = con.execute(
         """
@@ -239,6 +281,8 @@ def metrics_payload(con) -> dict[str, Any]:
     if not pump_starts_df.empty:
         out.update(pump_starts_df.iloc[0].to_dict())
 
+    out.update(runtime_counters(con))
+
     return clean_record(out)
 
 
@@ -286,7 +330,9 @@ def latest(x_api_key: Optional[str] = Header(default=None)):
         ).fetchdf()
         if df.empty:
             return {}
-        return clean_record(df.iloc[0].to_dict())
+        payload = df.iloc[0].to_dict()
+        payload.update(runtime_counters(con))
+        return clean_record(payload)
     finally:
         con.close()
 

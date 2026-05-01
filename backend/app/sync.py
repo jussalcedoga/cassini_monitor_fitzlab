@@ -1,15 +1,16 @@
 from __future__ import annotations
 
-import os
-import json
-import shutil
 import errno
+import json
+import os
+import shutil
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Any, List, Tuple
+from typing import Any
 
-from app.config import DATA_DIR, WAREHOUSE_ROOT, LOG_DIR, DB_PATH, DB_READONLY_PATH, ensure_dirs
+from app.bluefors_logs import READING_COLUMNS, build_day_frame, day_directories, day_signature
+from app.config import DATA_DIR, DB_PATH, DB_READONLY_PATH, LOG_DIR, LOGS_ROOT, ensure_dirs
 from app.db import connect
 
 SYNC_LOG = LOG_DIR / "sync.log"
@@ -17,26 +18,20 @@ LOCK_FILE = LOG_DIR / "sync.lock"
 LOCK_STALE_AFTER_SECONDS = int(os.getenv("SYNC_LOCK_STALE_AFTER_SECONDS", "3600"))
 LOCK_PROCESS_HINTS = ("sync_once.py", "run_sync_once.sh")
 
-COLUMN_LIST = [
-    "ts_eastern",
-    "P1","P2","P3","P4","P5","P6",
-    "T_50K","T_4K","T_Still","T_MXC","Flow",
-    "total_hours_scroll_1","total_hours_scroll_2",
-    "total_hours_turbo_1","total_hours_pulse_tube",
-    "scroll_1","scroll_2","turbo_1","pulse_tube",
-]
 
 def log(msg: str) -> None:
     ensure_dirs()
     line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
     print(line, flush=True)
-    with SYNC_LOG.open("a", encoding="utf-8") as f:
-        f.write(line + "\n")
+    with SYNC_LOG.open("a", encoding="utf-8") as handle:
+        handle.write(line + "\n")
+
 
 def _lock_age_seconds() -> float:
     if not LOCK_FILE.exists():
         return 0.0
     return max(0.0, datetime.now().timestamp() - LOCK_FILE.stat().st_mtime)
+
 
 def _read_lock_info() -> dict[str, Any]:
     info: dict[str, Any] = {"pid": None, "started_at": None}
@@ -67,12 +62,14 @@ def _read_lock_info() -> dict[str, Any]:
         pass
     return info
 
+
 def _pid_exists(pid: int) -> bool:
     try:
         os.kill(pid, 0)
         return True
     except OSError as exc:
         return exc.errno == errno.EPERM
+
 
 def _pid_looks_like_sync(pid: int) -> bool | None:
     cmdline_path = Path("/proc") / str(pid) / "cmdline"
@@ -85,6 +82,7 @@ def _pid_looks_like_sync(pid: int) -> bool | None:
         return None
 
     return any(hint in cmdline for hint in LOCK_PROCESS_HINTS)
+
 
 def _stale_lock_reason() -> str | None:
     if not LOCK_FILE.exists():
@@ -108,6 +106,7 @@ def _stale_lock_reason() -> str | None:
 
     return None
 
+
 def _clear_stale_lock(reason: str) -> None:
     try:
         LOCK_FILE.unlink()
@@ -116,6 +115,7 @@ def _clear_stale_lock(reason: str) -> None:
         pass
     except Exception as exc:
         log(f"failed to clear stale lock: {exc}")
+
 
 def acquire_lock() -> bool:
     ensure_dirs()
@@ -137,6 +137,7 @@ def acquire_lock() -> bool:
     except FileExistsError:
         return False
 
+
 def release_lock() -> None:
     try:
         if LOCK_FILE.exists():
@@ -144,39 +145,35 @@ def release_lock() -> None:
     except Exception:
         pass
 
-def parquet_files(root: Path) -> List[Path]:
-    return sorted(root.glob("year=*/month=*/day=*/*.parquet"))
+
+def source_roots(root: Path) -> list[Path]:
+    return day_directories(root)
+
 
 def path_check() -> dict[str, Any]:
-    files = parquet_files(WAREHOUSE_ROOT) if WAREHOUSE_ROOT.exists() else []
+    days = source_roots(LOGS_ROOT) if LOGS_ROOT.exists() else []
     return {
-        "warehouse_exists": WAREHOUSE_ROOT.exists(),
-        "warehouse_root": str(WAREHOUSE_ROOT),
-        "parquet_count": len(files),
-        "sample_files": [str(path) for path in files[:5]],
+        "logs_root_exists": LOGS_ROOT.exists(),
+        "logs_root": str(LOGS_ROOT),
+        "source_count": len(days),
+        "sample_sources": [str(path) for path in days[:5]],
     }
 
-def file_sig(path: Path) -> Tuple[int, int]:
-    st = path.stat()
-    return st.st_size, st.st_mtime_ns
 
-def changed_files(con, files: List[Path]) -> List[Path]:
+def changed_sources(con, day_dirs: list[Path]) -> list[Path]:
     changed = []
-    for p in files:
-        size_bytes, mtime_ns = file_sig(p)
+    for day_dir in day_dirs:
+        size_bytes, mtime_ns = day_signature(day_dir)
         row = con.execute(
             "SELECT size_bytes, mtime_ns FROM ingested_files WHERE path = ?",
-            [str(p)]
+            [str(day_dir)],
         ).fetchone()
         if row is None or row[0] != size_bytes or row[1] != mtime_ns:
-            changed.append(p)
+            changed.append(day_dir)
     return changed
 
+
 def refresh_readonly_snapshot() -> None:
-    """
-    Copy the writable DB to a read-only snapshot after sync finishes.
-    Use a temp file + atomic replace so the API never sees a partial file.
-    """
     ensure_dirs()
 
     legacy_tmp_path = DB_READONLY_PATH.with_suffix(".tmp")
@@ -206,6 +203,7 @@ def refresh_readonly_snapshot() -> None:
             except Exception:
                 pass
 
+
 def sync_once() -> dict:
     if not acquire_lock():
         log("sync already running, skipping")
@@ -213,81 +211,67 @@ def sync_once() -> dict:
 
     con = None
     try:
-        if not WAREHOUSE_ROOT.exists():
-            raise FileNotFoundError(f"Warehouse root not found: {WAREHOUSE_ROOT}")
+        if not LOGS_ROOT.exists():
+            raise FileNotFoundError(f"BlueFors logs root not found: {LOGS_ROOT}")
 
         con = connect(write=True)
-        files = parquet_files(WAREHOUSE_ROOT)
-        changed = changed_files(con, files)
+        days = source_roots(LOGS_ROOT)
+        changed = changed_sources(con, days)
 
-        log(f"warehouse={WAREHOUSE_ROOT}")
-        log(f"discovered_parquet_files={len(files)} changed_files={len(changed)}")
+        log(f"logs_root={LOGS_ROOT}")
+        log(f"discovered_log_sources={len(days)} changed_sources={len(changed)}")
 
         files_synced = 0
+        latest_ts = None
 
-        for idx, p in enumerate(changed, start=1):
-            size_bytes, mtime_ns = file_sig(p)
-            log(f"[{idx}/{len(changed)}] syncing {p}")
+        for idx, day_dir in enumerate(changed, start=1):
+            size_bytes, mtime_ns = day_signature(day_dir)
+            log(f"[{idx}/{len(changed)}] rebuilding {day_dir}")
 
-            con.execute("DELETE FROM readings WHERE source_file = ?", [str(p)])
+            day_df = build_day_frame(day_dir)
+            con.execute("DELETE FROM readings WHERE source_file = ?", [str(day_dir)])
 
-            con.execute(
-                f"""
-                INSERT OR REPLACE INTO readings (
-                    {", ".join(COLUMN_LIST)},
-                    source_file
+            if not day_df.empty:
+                con.register("day_frame", day_df)
+                con.execute(
+                    f"""
+                    INSERT OR REPLACE INTO readings ({", ".join(READING_COLUMNS)})
+                    SELECT {", ".join(READING_COLUMNS)}
+                    FROM day_frame
+                    """
                 )
-                SELECT
-                    {", ".join(COLUMN_LIST)},
-                    ? AS source_file
-                FROM read_parquet(?)
-                """,
-                [str(p), str(p)]
-            )
+                con.unregister("day_frame")
 
             con.execute(
                 """
                 INSERT OR REPLACE INTO ingested_files(path, size_bytes, mtime_ns, ingested_at)
                 VALUES (?, ?, ?, NOW())
                 """,
-                [str(p), size_bytes, mtime_ns]
+                [str(day_dir), size_bytes, mtime_ns],
             )
-
             files_synced += 1
 
         total_rows = con.execute("SELECT COUNT(*) FROM readings").fetchone()[0]
-        total_files = con.execute("SELECT COUNT(*) FROM ingested_files").fetchone()[0]
+        total_sources = con.execute("SELECT COUNT(*) FROM ingested_files").fetchone()[0]
+        latest_ts = con.execute("SELECT MAX(ts_eastern) FROM readings").fetchone()[0]
 
         con.close()
         con = None
-
-        snapshot_status = "ok"
-        snapshot_error = None
-
-        # Refresh the API snapshot only after the writer connection is fully closed.
-        # If publication fails, keep the ingest successful and report the degraded state.
-        try:
-            refresh_readonly_snapshot()
-        except Exception as exc:
-            snapshot_status = "error"
-            snapshot_error = str(exc)
-            log(f"readonly snapshot refresh failed: {exc}")
+        refresh_readonly_snapshot()
 
         result = {
-            "status": "ok" if snapshot_error is None else "degraded_snapshot",
-            "files_seen": len(files),
-            "files_changed": len(changed),
-            "files_synced": files_synced,
-            "tracked_files": total_files,
+            "status": "ok",
+            "checked_at": datetime.now().isoformat(timespec="seconds"),
+            "sources_seen": len(days),
+            "sources_changed": len(changed),
+            "sources_synced": files_synced,
+            "tracked_sources": total_sources,
             "rows_total": total_rows,
+            "latest_ts_eastern": latest_ts.isoformat() if latest_ts is not None else None,
             "snapshot_path": str(DB_READONLY_PATH),
-            "snapshot_status": snapshot_status,
         }
-        if snapshot_error is not None:
-            result["snapshot_error"] = snapshot_error
         log(json.dumps(result))
         return result
-
     finally:
         if con is not None:
             try:
