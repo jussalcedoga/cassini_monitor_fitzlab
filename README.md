@@ -165,6 +165,47 @@ You can check local API health at:
 
 - `http://127.0.0.1:8001/health`
 
+## Production Recipe On Windows
+
+If you want the setup that is least likely to fail again, use this exact recipe:
+
+1. Put the repo on the Windows machine that receives the BlueFors logs.
+2. Set `BLUEFORS_LOGS_ROOT` in `backend/.env`.
+3. Run `bash scripts/windows_bootstrap.sh`.
+4. Run `bash scripts/run_sync_once.sh` once to backfill the entire database.
+5. Create a named Cloudflare Tunnel instead of relying on a quick tunnel.
+6. Put the tunnel token in `backend/.env` as `CLOUDFLARE_TUNNEL_TOKEN=...`.
+7. Run `bash scripts/run_windows_stack.sh`.
+8. Register that same command in Windows Task Scheduler with an `At startup` trigger.
+9. Point Streamlit secrets at the fixed tunnel hostname.
+
+This gives you three layers of protection:
+
+- the sync loop re-runs every minute
+- the Windows stack supervisor restarts the sync loop, API, or tunnel if any of them exit
+- Task Scheduler brings the whole stack back after a reboot
+
+## Build The Database From Scratch
+
+This is the exact initial database build flow on the Windows host:
+
+```bash
+cd /c/Users/Fitzlab/cassini_monitor_fitzlab
+cp backend/.env.example backend/.env
+bash scripts/windows_bootstrap.sh
+bash scripts/run_sync_once.sh
+```
+
+After the backfill finishes:
+
+- the writable database will be at `backend/data/cassini.duckdb`
+- the readonly snapshot will be at `backend/data/cassini_readonly.duckdb`
+
+You can inspect the sync result in:
+
+- `backend/logs/sync.log`
+- `logs/sync-loop.log`
+
 ## Cloudflare Options
 
 ### Recommended: named tunnel
@@ -183,6 +224,23 @@ This is the best production path because:
 - Streamlit secrets do not need to change after reboots
 - the deployment is much less brittle than quick tunnels
 
+Step by step:
+
+1. In the Cloudflare dashboard, go to Zero Trust.
+2. Open Networks > Tunnels.
+3. Create a new Cloudflare Tunnel for this backend.
+4. Choose the Windows connector flow.
+5. Add a public hostname that points to `http://127.0.0.1:8001`.
+6. Copy the tunnel token.
+7. Paste that token into `backend/.env` as `CLOUDFLARE_TUNNEL_TOKEN=...`.
+8. Start the backend with `bash scripts/run_windows_stack.sh`.
+9. Put the resulting fixed hostname into Streamlit secrets as `api_base`.
+
+Official references:
+
+- Tunnel tokens: https://developers.cloudflare.com/tunnel/advanced/tunnel-tokens/
+- Useful tunnel commands: https://developers.cloudflare.com/tunnel/advanced/local-management/tunnel-useful-commands/
+
 ### Fallback: quick tunnel
 
 If `CLOUDFLARE_TUNNEL_TOKEN` is empty, the same runner falls back to:
@@ -199,7 +257,16 @@ If you prefer not to keep a Git Bash window open, create a Windows Task Schedule
 
 Recommended settings:
 
+- Name: `Cassini BlueFors Backend`
+- Trigger: `At startup`
+- General: `Run whether user is logged on or not`
+- General: `Run with highest privileges`
+- Conditions: uncheck `Start the task only if the computer is on AC power` if needed for your machine
+- Settings: `If the task fails, restart every 1 minute`
+- Settings: `Attempt to restart up to 3 times`
+- Settings: `If the task is already running, then the following rule applies: Do not start a new instance`
 - Program/script: `C:\Program Files\Git\bin\bash.exe`
+- Start in: `C:\Users\Fitzlab\cassini_monitor_fitzlab`
 - Add arguments:
 
 ```text
@@ -207,6 +274,16 @@ Recommended settings:
 ```
 
 If you use Task Scheduler, a named Cloudflare tunnel is strongly recommended. Otherwise the quick-tunnel URL may change after a reboot and Streamlit secrets will need to be updated again.
+
+### If you want to run the tunnel separately
+
+If you decide to manage the Cloudflare tunnel separately from the bash stack, you can disable the tunnel child process and only run sync + API:
+
+```text
+-lc "cd '/c/Users/Fitzlab/cassini_monitor_fitzlab' && RUN_TUNNEL=0 bash scripts/run_windows_stack.sh"
+```
+
+That is useful if you later move the tunnel onto a dedicated Cloudflare-managed Windows service.
 
 ## DuckDB Mirror Design
 
