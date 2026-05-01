@@ -98,35 +98,54 @@ Expected outputs:
 
 This first run can take time if you have a long BlueFors history.
 
-## Step 5. Create A Stable Cloudflare Tunnel
+## Step 5. Start With A Free Quick Tunnel
 
-Use a named tunnel, not a quick tunnel, for production.
+The default path in this repo is a free Cloudflare Quick Tunnel.
 
-In Cloudflare Zero Trust:
+Leave this blank in `backend/.env`:
 
-1. Go to `Networks` > `Tunnels`.
-2. Create a new Cloudflare Tunnel.
-3. Choose the Windows connector flow.
-4. Add a public hostname that points to:
-
-```text
-http://127.0.0.1:8001
+```dotenv
+CLOUDFLARE_TUNNEL_TOKEN=
 ```
 
-5. Copy the tunnel token.
-6. Paste it into `backend/.env`:
+When you run the backend stack, `cloudflared` will launch:
+
+```bash
+cloudflared tunnel --url http://127.0.0.1:8001
+```
+
+and print a random public `https://...trycloudflare.com` URL.
+
+Use that URL as `api_base` in Streamlit secrets.
+
+Cloudflare’s Quick Tunnel docs currently say this path is free, but it has tradeoffs:
+
+- the public URL changes whenever the tunnel restarts
+- there is no SLA or uptime guarantee
+- there is a 200 in-flight request limit
+- SSE is not supported
+
+Official reference:
+
+- https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/
+
+## Step 6. Optional Stable Tunnel Later
+
+If you later decide you want a fixed hostname, this repo also supports a named tunnel.
+
+In that case:
+
+1. Go to Cloudflare Zero Trust.
+2. Open `Networks` > `Tunnels`.
+3. Create a tunnel that points to `http://127.0.0.1:8001`.
+4. Copy the token.
+5. Paste it into `backend/.env`:
 
 ```dotenv
 CLOUDFLARE_TUNNEL_TOKEN=your_token_here
 ```
 
-Why named tunnel instead of quick tunnel:
-
-- the hostname stays fixed across reboots
-- Streamlit secrets do not need to be edited every time the tunnel restarts
-- it is the right production option for a lab installation
-
-## Step 6. Start The Live Backend
+## Step 7. Start The Live Backend
 
 Run:
 
@@ -148,7 +167,7 @@ Useful logs:
 - `logs/windows-api.log`
 - `logs/windows-tunnel.log`
 
-## Step 7. Verify The Backend Before Moving On
+## Step 8. Verify The Backend Before Moving On
 
 Open these in a browser on the Windows machine:
 
@@ -161,7 +180,7 @@ Healthy output should include:
 - a recent `latest_ts_eastern`
 - a nonzero row count after the backfill
 
-## Step 8. Make It Survive Reboots
+## Step 9. Make It Survive Reboots
 
 Create a Windows Task Scheduler job.
 
@@ -201,7 +220,7 @@ This gives you three safety layers:
 - the stack supervisor restarts child processes if they exit
 - Task Scheduler restarts the full stack after a reboot
 
-## Step 9. Deploy The Frontend On Streamlit Community Cloud
+## Step 10. Deploy The Frontend On Streamlit Community Cloud
 
 According to Streamlit’s Community Cloud deployment flow, you deploy by selecting the repository, branch, and entrypoint file, then optionally setting secrets and Python version in Advanced settings. Official docs:
 
@@ -236,7 +255,7 @@ After deployment:
 - confirm the latest timestamp is fresh
 - if needed, open app `Settings` and update the `Secrets` tab later
 
-## Step 10. Daily Operations Checklist
+## Step 11. Daily Operations Checklist
 
 If the dashboard ever looks stale:
 
@@ -258,7 +277,7 @@ This design avoids the fragile parts of the older server-side flow:
 - no dependence on a separate Linux host
 - direct ingest from the machine that actually receives the BlueFors logs
 - local database mirror for fast reads
-- named tunnel for a stable public hostname
+- a free quick tunnel by default, with named tunnel support kept optional
 - scheduler plus supervision for restart behavior
 
 ## Good Fit And Limitations
@@ -285,7 +304,8 @@ cd /c/Users/Fitzlab
 git clone https://github.com/jussalcedoga/cassini_monitor_fitzlab.git
 cd cassini_monitor_fitzlab
 cp backend/.env.example backend/.env
-# edit backend/.env and set BLUEFORS_LOGS_ROOT + CLOUDFLARE_TUNNEL_TOKEN
+# edit backend/.env and set BLUEFORS_LOGS_ROOT
+# leave CLOUDFLARE_TUNNEL_TOKEN blank for a free quick tunnel
 bash scripts/windows_bootstrap.sh
 bash scripts/run_sync_once.sh
 bash scripts/run_windows_stack.sh
@@ -296,3 +316,4 @@ Then:
 - add the same command to Windows Task Scheduler
 - deploy `streamlit_app.py` on Streamlit Community Cloud
 - set `api_base`, `api_key`, and `dashboard_password` in Streamlit secrets
+- if the quick tunnel URL changes after a reboot, update `api_base` again

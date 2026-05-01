@@ -178,23 +178,25 @@ You can check local API health at:
 
 ## Production Recipe On Windows
 
-If you want the setup that is least likely to fail again, use this exact recipe:
+If you want the simplest free setup, use this exact recipe:
 
 1. Put the repo on the Windows machine that receives the BlueFors logs.
 2. Set `BLUEFORS_LOGS_ROOT` in `backend/.env`.
 3. Run `bash scripts/windows_bootstrap.sh`.
 4. Run `bash scripts/run_sync_once.sh` once to backfill the entire database.
-5. Create a named Cloudflare Tunnel instead of relying on a quick tunnel.
-6. Put the tunnel token in `backend/.env` as `CLOUDFLARE_TUNNEL_TOKEN=...`.
-7. Run `bash scripts/run_windows_stack.sh`.
-8. Register that same command in Windows Task Scheduler with an `At startup` trigger.
-9. Point Streamlit secrets at the fixed tunnel hostname.
+5. Leave `CLOUDFLARE_TUNNEL_TOKEN` blank so the stack uses a free quick tunnel.
+6. Run `bash scripts/run_windows_stack.sh`.
+7. Copy the printed `https://...trycloudflare.com` URL.
+8. Put that URL into Streamlit secrets as `api_base`.
+9. Register that same command in Windows Task Scheduler with an `At startup` trigger.
 
 This gives you three layers of protection:
 
 - the sync loop re-runs every minute
 - the Windows stack supervisor restarts the sync loop, API, or tunnel if any of them exit
 - Task Scheduler brings the whole stack back after a reboot
+
+The tradeoff is that if the quick-tunnel URL changes after a reboot or restart, you will need to update `api_base` in Streamlit secrets.
 
 ## Build The Database From Scratch
 
@@ -219,9 +221,36 @@ You can inspect the sync result in:
 
 ## Cloudflare Options
 
-### Recommended: named tunnel
+### Default: quick tunnel
 
-For a stable public hostname, use a named Cloudflare Tunnel and place its token in `backend/.env`:
+If `CLOUDFLARE_TUNNEL_TOKEN` is empty, the runner uses a free quick tunnel:
+
+```bash
+cloudflared tunnel --url http://127.0.0.1:8001
+```
+
+That prints a random public `https://...trycloudflare.com` URL in the terminal and in `logs/windows-tunnel.log`.
+
+Use that URL as:
+
+```toml
+api_base = "https://your-random-subdomain.trycloudflare.com"
+```
+
+According to Cloudflare’s Quick Tunnel docs, this path is free, but it comes with important tradeoffs:
+
+- the URL changes whenever the tunnel restarts
+- Cloudflare does not promise uptime or SLA for quick tunnels
+- quick tunnels have a 200 in-flight request limit
+- quick tunnels do not support SSE
+
+Official reference:
+
+- Quick Tunnels: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/
+
+### Optional: named tunnel
+
+If you later want a stable public hostname, you can use a named Cloudflare Tunnel and place its token in `backend/.env`:
 
 ```dotenv
 CLOUDFLARE_TUNNEL_TOKEN=your_token_here
@@ -252,16 +281,6 @@ Official references:
 - Tunnel tokens: https://developers.cloudflare.com/tunnel/advanced/tunnel-tokens/
 - Useful tunnel commands: https://developers.cloudflare.com/tunnel/advanced/local-management/tunnel-useful-commands/
 
-### Fallback: quick tunnel
-
-If `CLOUDFLARE_TUNNEL_TOKEN` is empty, the same runner falls back to:
-
-```bash
-cloudflared tunnel --url http://127.0.0.1:8001
-```
-
-That is convenient for testing, but the `trycloudflare.com` URL changes whenever the tunnel restarts.
-
 ## Optional: Task Scheduler Instead Of A Visible Terminal
 
 If you prefer not to keep a Git Bash window open, create a Windows Task Scheduler job that runs at logon.
@@ -284,7 +303,7 @@ Recommended settings:
 -lc "cd '/c/Users/Fitzlab/cassini_monitor_fitzlab' && bash scripts/run_windows_stack.sh"
 ```
 
-If you use Task Scheduler, a named Cloudflare tunnel is strongly recommended. Otherwise the quick-tunnel URL may change after a reboot and Streamlit secrets will need to be updated again.
+If you use Task Scheduler with a quick tunnel, remember that the public URL may change after a reboot, which means `api_base` in Streamlit secrets may need to be updated again.
 
 ### If you want to run the tunnel separately
 
