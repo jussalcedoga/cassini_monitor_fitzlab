@@ -17,6 +17,17 @@ This repo now assumes the backend runs on the Windows machine that already has t
 - Streamlit dashboard: https://cassini-fitzlab.streamlit.app/
 - GitHub repo: https://github.com/jussalcedoga/cassini_monitor_fitzlab
 
+## Deployment Guides
+
+- Windows BlueFors deployment checklist: [docs/BLUEFORS_WINDOWS_DEPLOYMENT_CHECKLIST.md](docs/BLUEFORS_WINDOWS_DEPLOYMENT_CHECKLIST.md)
+
+If you want the shortest reusable guide for another BlueFors lab, start with that checklist. It covers:
+
+- building the DuckDB mirror from raw BlueFors logs
+- creating the Cloudflare tunnel on the Windows host
+- keeping the backend alive with Task Scheduler
+- deploying the Streamlit frontend on Streamlit Community Cloud
+
 ## Architecture
 
 The deployment is intentionally simple:
