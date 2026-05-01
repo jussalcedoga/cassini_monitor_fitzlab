@@ -19,6 +19,7 @@ REQUEST_TIMEOUT_SECONDS = 10
 PLOT_MAX_POINTS = 1200
 FETCH_RETRIES = 1
 FETCH_RETRY_SLEEP_SECONDS = 0.35
+PLOTLY_THEME = "streamlit"
 
 st.set_page_config(
     page_title="Cassini BlueFors Dashboard",
@@ -919,11 +920,10 @@ def make_multi_trace_figure(
             xanchor="left",
             y=0.98,
             yanchor="top",
-            font=dict(size=22, color="black"),
+            font=dict(size=22),
         ),
-        template="none",
-        paper_bgcolor="white",
-        plot_bgcolor="white",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
         hovermode="x unified",
         autosize=True,
         height=height,
@@ -935,39 +935,42 @@ def make_multi_trace_figure(
             xanchor="left",
             x=0,
             bgcolor="rgba(0,0,0,0)",
-            font=dict(size=15, color="black"),
+            font=dict(size=15),
             itemwidth=84,
             tracegroupgap=10,
         ),
-        font=dict(color="black"),
         xaxis=dict(
-            title=dict(text="Time", standoff=22, font=dict(size=18, color="black")),
+            title=dict(text="Time", standoff=22, font=dict(size=18)),
             tickformat="%b %d\n%H:%M",
-            tickfont=dict(size=15, color="black"),
-            showgrid=False,
+            tickfont=dict(size=15),
+            showgrid=True,
+            gridcolor="rgba(148,163,184,0.18)",
+            griddash="dot",
             zeroline=False,
             showline=True,
             linewidth=1.4,
-            linecolor="black",
             ticks="outside",
             ticklen=7,
             tickwidth=1.4,
-            tickcolor="black",
             automargin=True,
         ),
         yaxis=dict(
-            title=dict(text=yaxis_title, standoff=22, font=dict(size=18, color="black")),
-            tickfont=dict(size=15, color="black"),
-            showgrid=False,
+            title=dict(text=yaxis_title, standoff=22, font=dict(size=18)),
+            tickfont=dict(size=15),
+            showgrid=True,
+            gridcolor="rgba(148,163,184,0.18)",
+            griddash="dot",
             zeroline=False,
             showline=True,
             linewidth=1.4,
-            linecolor="black",
             ticks="outside",
             ticklen=7,
             tickwidth=1.4,
-            tickcolor="black",
             automargin=True,
+        ),
+        hoverlabel=dict(
+            bgcolor="rgba(15,23,42,0.92)",
+            font=dict(color="#f8fafc", size=14),
         ),
     )
 
@@ -1186,7 +1189,7 @@ def render_dashboard_page():
         )
         st.plotly_chart(
             fig_temp,
-            theme=None,
+            theme=PLOTLY_THEME,
             use_container_width=True,
             config={"displaylogo": False, "responsive": True},
         )
@@ -1202,7 +1205,7 @@ def render_dashboard_page():
         )
         st.plotly_chart(
             fig_press,
-            theme=None,
+            theme=PLOTLY_THEME,
             use_container_width=True,
             config={"displaylogo": False, "responsive": True},
         )
@@ -1229,7 +1232,7 @@ def render_dashboard_page():
         )
         st.plotly_chart(
             fig_temp,
-            theme=None,
+            theme=PLOTLY_THEME,
             use_container_width=True,
             config={"displaylogo": False, "responsive": True},
         )
@@ -1273,7 +1276,7 @@ def render_dashboard_page():
         )
         st.plotly_chart(
             fig_press,
-            theme=None,
+            theme=PLOTLY_THEME,
             use_container_width=True,
             config={"displaylogo": False, "responsive": True},
         )
@@ -1296,7 +1299,7 @@ def render_dashboard_page():
         )
         st.plotly_chart(
             fig_flow,
-            theme=None,
+            theme=PLOTLY_THEME,
             use_container_width=True,
             config={"displaylogo": False, "responsive": True},
         )
@@ -1421,7 +1424,7 @@ def render_dashboard_page():
                     )
                     st.plotly_chart(
                         fig_em,
-                        theme=None,
+                        theme=PLOTLY_THEME,
                         use_container_width=True,
                         config={"displaylogo": False, "responsive": True},
                     )
@@ -1495,7 +1498,7 @@ def render_dashboard_page():
         fig_state.update_yaxes(range=[-0.1, 1.1], tickvals=[0, 1])
         st.plotly_chart(
             fig_state,
-            theme=None,
+            theme=PLOTLY_THEME,
             use_container_width=True,
             config={"displaylogo": False, "responsive": True},
         )
