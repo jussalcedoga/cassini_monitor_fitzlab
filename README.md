@@ -283,7 +283,7 @@ Official references:
 
 ## Optional: Task Scheduler Instead Of A Visible Terminal
 
-If you prefer not to keep a Git Bash window open, create a Windows Task Scheduler job that runs at logon.
+If you prefer not to keep a Git Bash window open, create a Windows Task Scheduler job that runs at startup.
 
 Recommended settings:
 

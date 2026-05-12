@@ -58,6 +58,8 @@ MXC_SENSOR_FLOOR_LOOKBACK_H = 3.0
 MXC_BASE_TREND_TOL_KPH = 0.004
 MXC_COLD_TREND_KPH = 0.006
 MXC_WARM_TREND_KPH = 0.006
+MXC_PRECOOL_THRESHOLD_K = 1.0
+STILL_PRECOOL_THRESHOLD_K = 10.0
 
 PRETTY_NAMES = {
     "T_50K": "50 K Stage",
@@ -636,6 +638,12 @@ def fridge_state(latest: dict, histories: Dict[str, pd.DataFrame]) -> tuple[str,
 
     if in_base_band:
         return "At base", f"MXC is at {fmt_temp(mxc, always_mk=True)} and within the base-temperature band.", "base"
+
+    if pumps_on and (
+        mxc >= MXC_PRECOOL_THRESHOLD_K
+        or (still_value is not None and still_value >= STILL_PRECOOL_THRESHOLD_K)
+    ):
+        return "Precooling", "Cryostat is far above base and still in the warm part of the cooldown.", "cooling"
 
     if slope is not None and slope <= -cool_threshold:
         return "Cooling down", "MXC is still trending colder.", "cooling"
