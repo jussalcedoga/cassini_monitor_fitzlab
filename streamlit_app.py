@@ -60,6 +60,8 @@ MXC_COLD_TREND_KPH = 0.006
 MXC_WARM_TREND_KPH = 0.006
 MXC_PRECOOL_THRESHOLD_K = 1.0
 STILL_PRECOOL_THRESHOLD_K = 10.0
+MXC_WARM_STATE_THRESHOLD_K = 20.0
+STILL_WARM_STATE_THRESHOLD_K = 250.0
 
 PRETTY_NAMES = {
     "T_50K": "50 K Stage",
@@ -632,6 +634,12 @@ def fridge_state(latest: dict, histories: Dict[str, pd.DataFrame]) -> tuple[str,
     in_base_band = mxc <= MXC_BASE_TARGET_K or (
         mxc <= MXC_BASE_TARGET_K + MXC_BASE_BAND_K and (slope is None or abs(slope) <= MXC_BASE_TREND_TOL_KPH)
     )
+    in_warm_band = mxc >= MXC_WARM_STATE_THRESHOLD_K or (
+        still_value is not None and still_value >= STILL_WARM_STATE_THRESHOLD_K
+    )
+
+    if in_warm_band:
+        return "Warm", "Cryostat is still near ambient temperature and far from base.", "default"
 
     if slope is not None and slope >= warm_threshold:
         return "Warming up", "MXC is trending warmer.", "warming"

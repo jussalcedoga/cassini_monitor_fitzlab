@@ -214,6 +214,12 @@ C:\Users\Fitzlab\cassini_monitor_fitzlab
 -lc "cd '/c/Users/Fitzlab/cassini_monitor_fitzlab' && bash scripts/run_windows_stack.sh"
 ```
 
+Path note:
+
+- `C:\Users\Fitzlab\cassini_monitor_fitzlab` is the normal Windows path and belongs in Task Scheduler's `Start in` field.
+- `/c/Users/Fitzlab/cassini_monitor_fitzlab` is the Git Bash version of the same path and belongs inside the `bash -lc "cd ..."` command.
+- You do not need `..` there. In Git Bash, the `C:` drive appears as `/c`.
+
 This gives you three safety layers:
 
 - the sync loop runs every minute
