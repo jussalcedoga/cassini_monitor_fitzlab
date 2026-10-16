@@ -25,19 +25,23 @@ If you want the shortest reusable guide for another BlueFors lab, start with tha
 
 - building the DuckDB mirror from raw BlueFors logs
 - creating the Cloudflare tunnel on the Windows host
-- keeping the backend alive with Task Scheduler
+- keeping the backend alive as Windows services
 - deploying the Streamlit frontend on Streamlit Community Cloud
 
 ## Architecture
 
-The deployment is intentionally simple:
+```text
+BlueFors logs ─► CassiniAPI service ──────────────────► CassiniTunnel service ─► Cloudflare ─► Streamlit Cloud
+                 sync thread: polls every 10 s           cloudflared quick tunnel                 streamlit_app.py
+                 DuckDB mirror + FastAPI on :8001        -> http://127.0.0.1:8001                 reads api_base
+                 tunnel monitor + watchdog threads
+```
 
-1. BlueFors writes text logs into a Windows folder such as `C:\Users\Fitzlab\Bluefors logs\24-09-11\...`.
-2. `scripts/run_sync_loop.sh` scans those day folders once per minute.
-3. Changed day folders are re-parsed into the same `readings` schema the frontend already expects.
-4. The backend writes a local DuckDB mirror at `backend/data/cassini.duckdb`.
-5. FastAPI serves `/latest`, `/metrics`, `/history/{key}`, and `/dashboard`.
-6. Cloudflare exposes that local API so Streamlit Cloud can reach it.
+1. BlueFors writes one line per minute into daily folders such as `C:\Users\Fitzlab\Bluefors logs\26-10-16\...`.
+2. The **CassiniAPI** Windows service (one Python process) polls the newest day folders every 10 seconds and mirrors new rows into `backend/data/cassini.duckdb`. New readings reach the API within about 10 seconds of BlueFors writing them.
+3. The same process serves `/health`, `/latest`, `/metrics`, `/history/{key}` and `/dashboard`. Payloads are computed once per data update and served from memory, gzip-compressed.
+4. The **CassiniTunnel** Windows service runs `cloudflared` and publishes the API through a free Cloudflare quick tunnel. It is a separate service on purpose: restarting or updating the API never changes the public URL.
+5. Streamlit Community Cloud runs `streamlit_app.py` and calls the API at `api_base`.
 
 The frontend does not need to know whether the data came from raw BlueFors logs or from any older parquet-based pipeline. It only needs a working `api_base`.
 
@@ -58,9 +62,11 @@ The runtime-hour cards shown in the dashboard are now integrated from the BlueFo
 ## Repo Layout
 
 - `streamlit_app.py`: Streamlit Community Cloud entrypoint
-- `backend/app/`: FastAPI app, BlueFors parsers, DuckDB logic, and sync code
-- `backend/data/`: local DuckDB mirror created on the backend host
-- `scripts/`: bootstrap, sync, API, and tunnel runner scripts
+- `backend/app/`: FastAPI app, BlueFors parsers, DuckDB store, sync worker, tunnel monitor
+- `backend/data/`: local DuckDB mirror created on the backend host (not in git)
+- `cassini.bat` + `deploy/cassini.ps1`: install and manage the Windows services
+- `runtime/`: self-contained Python and the WinSW service wrapper (not in git; see the quick start)
+- `scripts/`: one-off sync and legacy terminal runners
 - `services/`: optional Linux service files retained for manual use, but not required for the Windows deployment
 
 ## Streamlit Cloud Setup
@@ -75,169 +81,164 @@ Use secrets like:
 api_base = "https://YOUR_PUBLIC_API_HOSTNAME"
 api_key = "cassini"
 dashboard_password = "cassini"
+
+# Follow quick-tunnel URL changes automatically (values from backend/.env)
+api_url_topic = "cassini-fitzlab-..."
+api_url_key = "..."
 ```
 
 For a quick tunnel, `api_base` will be the printed `https://...trycloudflare.com` URL.
 
 For a named tunnel, `api_base` should be the stable hostname you configured in Cloudflare.
 
+### Automatic URL follow (quick tunnels)
+
+A quick-tunnel URL changes whenever cloudflared restarts, for example after a reboot. To keep the dashboard working without editing secrets each time:
+
+1. The backend publishes its current public URL to a private [ntfy.sh](https://ntfy.sh) topic once the URL answers publicly, and again every 6 hours (ntfy keeps messages for 12 hours). Each message is `{"url", "ts", "sig"}`, where `sig` is HMAC-SHA256 of `url|ts` under a secret key.
+2. The Streamlit app reads the newest message whose signature verifies and uses that URL. When a request fails, it re-checks within 30 seconds. Unsigned or forged messages are ignored, so knowing the topic is not enough to redirect the dashboard.
+3. If the lookup fails or the secrets are absent, the app uses `api_base`, so it behaves exactly as before.
+
+The topic and key are generated once and stored in `backend/.env` as `URL_ANNOUNCE_TOPIC` and `URL_ANNOUNCE_KEY`. Copy the same values into the Streamlit secrets as `api_url_topic` and `api_url_key`. `GET /health` shows the announcement status under `tunnel.announce`.
+
+### Cooldown / warm-up markers
+
+`GET /events` returns every cooldown and warm-up start in the full record. These are detected from the pulse tube switching on or off, ignoring blips shorter than 2 hours. The dashboard overlays them on every time-series plot, with a dashed line, a label, and light shading for the phase that follows. The fridge-state card also reports how long ago the current phase started. While the MXC thermometer is out of range (warm or precooling), the fridge state is derived from the 50 K / 4 K / Still stages and the pump states.
+
 A starter file is included at `.streamlit/secrets.toml.example`.
 
 ## Windows Backend Quick Start
 
-These steps are the recommended path on the machine that already has the BlueFors logs.
+These steps set up the backend on the machine that already has the BlueFors logs. Everything runs as Windows services: nothing depends on an open terminal or a logged-in user, and it all comes back by itself after a reboot.
 
-### 1. Install prerequisites
-
-Install these on the Windows machine:
-
-- Python 3.11 or newer
-- Git for Windows
-- Cloudflared
-
-Git Bash is the easiest shell for the scripts in this repo. Cloudflared can be installed from Cloudflare and left on `PATH`, or you can place `cloudflared.exe` at the repo root.
-
-### 2. Clone the repo on the Windows host
-
-Example Git Bash flow:
+### 1. Get the repo and the runtime
 
 ```bash
-cd /c/Users/Fitzlab
+cd /c/Users/Fitzlab/Desktop
 git clone https://github.com/jussalcedoga/cassini_monitor_fitzlab.git
 cd cassini_monitor_fitzlab
 ```
 
-### 3. Configure the backend
+The services need three binaries that are not stored in git:
 
-Copy the example environment file:
+- `runtime/python/`: a self-contained CPython 3.12 from [python-build-standalone](https://github.com/astral-sh/python-build-standalone/releases), with the `install_only` Windows x64 build extracted here. Do not use the Microsoft Store Python, because it cannot run inside a Windows service.
+- `runtime/bin/WinSW-x64.exe`: [WinSW v2.12.0](https://github.com/winsw/winsw/releases/tag/v2.12.0), the service wrapper.
+- `cloudflared.exe` at the repo root: [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) for Windows x64.
+
+Then install the backend dependencies into that Python:
 
 ```bash
-cp backend/.env.example backend/.env
+runtime/python/python.exe -m pip install -r backend/requirements.txt
 ```
 
-Then edit `backend/.env` and set at least:
+### 2. (Optional) Configure the backend
+
+The defaults match the FitzLab machine. To change them, copy `backend/.env.example` to `backend/.env` and edit it:
 
 ```dotenv
 BLUEFORS_LOGS_ROOT="C:/Users/Fitzlab/Bluefors logs"
 API_KEY=cassini
-API_HOST=127.0.0.1
-API_PORT=8001
-READONLY_MAX_LAG_SECONDS=180
-CLOUDFLARE_TUNNEL_TOKEN=
 ```
 
-Use forward slashes in `BLUEFORS_LOGS_ROOT` even on Windows. That avoids escaping issues in `.env`.
+Use forward slashes in `BLUEFORS_LOGS_ROOT` even on Windows. `API_KEY` must match `api_key` in the Streamlit secrets.
 
-### 4. Bootstrap the backend environment
+### 3. Install the services
 
-From Git Bash:
+Double-click `cassini.bat` and choose `install`, or from a terminal:
 
-```bash
-bash scripts/windows_bootstrap.sh
+```bat
+cassini.bat install
 ```
 
-That script creates `backend/.venv` and installs the backend dependencies.
+Approve the UAC prompt. The installer:
 
-### 5. Backfill the DuckDB mirror once
+- registers **CassiniAPI** and **CassiniTunnel** as automatic-start services running as LocalSystem, with restart-on-failure (5 s, 15 s, then every 30 s)
+- registers the **Cassini Service Guard** scheduled task, which runs at startup and every 5 minutes and starts either service if it was ever left stopped
+- starts both services, waits for the API to answer and for the tunnel URL, and writes the URL to `CURRENT_PUBLIC_URL.txt`
 
-If you want to build the database once before starting the full stack:
+On a fresh database the API serves the newest data within about 20 seconds, then backfills the full history newest-first. That takes about 5 minutes for two years of logs.
 
-```bash
-bash scripts/run_sync_once.sh
+### 4. Point Streamlit at the tunnel
+
+Copy the printed `https://...trycloudflare.com` URL (or run `cassini.bat url`) into the Streamlit secrets as `api_base`.
+
+## Daily Operations
+
+```bat
+cassini.bat                  :: status: services, latest reading, public URL check
+cassini.bat url              :: print the public URL and copy it to the clipboard
+cassini.bat restart-api      :: restart the API only; the public URL stays the same
+cassini.bat restart-tunnel   :: new cloudflared session; ISSUES A NEW URL
+cassini.bat stop | start     :: stop or start both services (stop also pauses the guard task)
+cassini.bat uninstall        :: remove the services and the guard task
 ```
 
-On the first run, the sync scans every BlueFors day directory under `BLUEFORS_LOGS_ROOT` and builds the initial DuckDB mirror.
+Logs are in `logs/`:
 
-### 6. Start the live backend loop
+- `CassiniAPI.err.log`: sync progress, errors, tunnel monitor events (Python logging goes to stderr)
+- `CassiniAPI.out.log`: HTTP access log
+- `CassiniTunnel.err.log`: cloudflared
+- `tunnel-url-history.log`: every public URL the tunnel has had, with timestamps
+- `deploy.log`: output of `cassini.bat` admin commands
 
-For the simplest always-on workflow, open Git Bash and run:
+WinSW rotates each log at 10 MB and keeps 5 files.
 
-```bash
-bash scripts/run_windows_stack.sh
+### Updating
+
+- Frontend: push to `main`. Streamlit Community Cloud redeploys `streamlit_app.py` on its own.
+- Backend: `git pull` on the backend host. The API watches `backend/app/*.py` and `backend/.env`; about 30-60 seconds after they change, it restarts itself to load the new code. The tunnel, and therefore the public URL, is not touched.
+
+### When does the public URL change?
+
+Quick-tunnel URLs are tied to the cloudflared process. The URL changes only when **CassiniTunnel** restarts: a reboot, `cassini.bat restart-tunnel`, or a rare cloudflared crash. API restarts, sync errors and network blips do not change it, because cloudflared reconnects to Cloudflare by itself with the same URL. With [automatic URL follow](#automatic-url-follow-quick-tunnels) configured, the dashboard switches to the new URL by itself within a few minutes. Without it, run `cassini.bat url` and paste the new URL into the Streamlit secrets as `api_base`.
+
+## Reliability Design
+
+| Failure | What happens |
+| --- | --- |
+| API process crashes | Service manager restarts it in 5 s; tunnel and URL unaffected |
+| Sync loop hangs or dies | Watchdog thread exits the process after 15 min with no progress; the service restarts it |
+| Service left stopped | The tunnel monitor (inside the API) restarts CassiniTunnel; the guard task restarts either service within 5 min |
+| Network outage | cloudflared keeps retrying; same URL when the network returns |
+| Quick tunnel dropped by Cloudflare | The hostname stops resolving; after 10 min (with internet otherwise working) the monitor restarts cloudflared and logs the new URL. It restarts at most once per hour |
+| Reboot / power loss | Both services start at boot without anyone logging in; the dashboard picks up the new tunnel URL from the signed announcement |
+| Idle sleep / hibernate | The API holds a Windows "system required" power request while it runs |
+| A log line is half-written when read | The incomplete last line is skipped and picked up on the next pass |
+
+Health at a glance: `http://127.0.0.1:8001/health` (or `<api_base>/health`) reports the latest reading time, `data_age_seconds`, a `stale` flag (no new data for 10 minutes), the last sync error, database size, and tunnel state.
+
+## DuckDB Mirror Design
+
+The backend keeps a local DuckDB mirror so the API stays fast and the dashboard can request time-series data without reparsing raw text files on every request.
+
+- One process owns the database file. DuckDB allows a single writer process, so the sync worker and the API share one connection, with a cursor per thread. There is no cross-process locking and no snapshot copy.
+- Each BlueFors day folder is one source unit. Its signature (total size + newest mtime) is read from the directory listing, so detecting changes across 700+ days takes about 0.15 s. Normal passes look only at new folders and the two newest days; a full rescan runs every 15 minutes.
+- Past days are written once. The live day only replaces its last 5 minutes of rows on each update, so write churn is a handful of rows per minute.
+- `readings` has no primary-key index. The original schema's index grew without bound under per-minute delete/insert churn (910k rows had bloated the old file to 9.3 GiB). The current file holds the full two-year history in 30-60 MB, because space freed by compaction is reused rather than growing the file.
+- After a backfill, and daily after that, the table is rewritten in time order and checkpointed. This reclaims deleted rows and keeps time-window queries pruned to the relevant row groups.
+- The parser parses timestamps in one vectorized pass (about 13x faster than per-row parsing) and produces identical rows.
+
+## Rebuild The Database From Scratch
+
+```bat
+cassini.bat stop
+move backend\data\cassini.duckdb backend\data\cassini.old.duckdb
+cassini.bat start
 ```
 
-That one command starts:
-
-- the 60-second sync loop
-- the local FastAPI server on `127.0.0.1:8001`
-- the Cloudflare tunnel runner
-
-Keep that terminal open if you want the simplest visible deployment.
-
-### 7. Verify locally
-
-Once the stack is up:
-
-- Sync log: `logs/windows-sync-loop.log`
-- API log: `logs/windows-api.log`
-- Tunnel log: `logs/windows-tunnel.log`
-
-You can check local API health at:
-
-- `http://127.0.0.1:8001/health`
-
-## Production Recipe On Windows
-
-If you want the simplest free setup, use this exact recipe:
-
-1. Put the repo on the Windows machine that receives the BlueFors logs.
-2. Set `BLUEFORS_LOGS_ROOT` in `backend/.env`.
-3. Run `bash scripts/windows_bootstrap.sh`.
-4. Run `bash scripts/run_sync_once.sh` once to backfill the entire database.
-5. Leave `CLOUDFLARE_TUNNEL_TOKEN` blank so the stack uses a free quick tunnel.
-6. Run `bash scripts/run_windows_stack.sh`.
-7. Copy the printed `https://...trycloudflare.com` URL.
-8. Put that URL into Streamlit secrets as `api_base`.
-9. Register that same command in Windows Task Scheduler with an `At startup` trigger.
-
-This gives you three layers of protection:
-
-- the sync loop re-runs every minute
-- the Windows stack supervisor restarts the sync loop, API, or tunnel if any of them exit
-- Task Scheduler brings the whole stack back after a reboot
-
-The tradeoff is that if the quick-tunnel URL changes after a reboot or restart, you will need to update `api_base` in Streamlit secrets.
-
-## Build The Database From Scratch
-
-This is the exact initial database build flow on the Windows host:
-
-```bash
-cd /c/Users/Fitzlab/cassini_monitor_fitzlab
-cp backend/.env.example backend/.env
-bash scripts/windows_bootstrap.sh
-bash scripts/run_sync_once.sh
-```
-
-After the backfill finishes:
-
-- the writable database will be at `backend/data/cassini.duckdb`
-- the readonly snapshot will be at `backend/data/cassini_readonly.duckdb`
-
-You can inspect the sync result in:
-
-- `backend/logs/sync.log`
-- `logs/sync-loop.log`
+The API rebuilds the mirror automatically, newest days first. Alternatively, with the services stopped, run `runtime\python\python.exe scripts\sync_once.py` to build it in the foreground.
 
 ## Cloudflare Options
 
 ### Default: quick tunnel
 
-If `CLOUDFLARE_TUNNEL_TOKEN` is empty, the runner uses a free quick tunnel:
+With no token configured, CassiniTunnel runs a free quick tunnel:
 
 ```bash
-cloudflared tunnel --url http://127.0.0.1:8001
+cloudflared tunnel --no-autoupdate --metrics 127.0.0.1:20241 --url http://127.0.0.1:8001
 ```
 
-That prints a random public `https://...trycloudflare.com` URL in the terminal and in `logs/windows-tunnel.log`.
-
-Use that URL as:
-
-```toml
-api_base = "https://your-random-subdomain.trycloudflare.com"
-```
-
-According to Cloudflare’s Quick Tunnel docs, this path is free, but it comes with important tradeoffs:
+Cloudflare's Quick Tunnel docs list important tradeoffs:
 
 - the URL changes whenever the tunnel restarts
 - Cloudflare does not promise uptime or SLA for quick tunnels
@@ -250,146 +251,37 @@ Official reference:
 
 ### Optional: named tunnel
 
-If you later want a stable public hostname, you can use a named Cloudflare Tunnel and place its token in `backend/.env`:
+If you later want a hostname that never changes (this needs a domain on a Cloudflare account):
 
-```dotenv
-CLOUDFLARE_TUNNEL_TOKEN=your_token_here
-```
-
-When `CLOUDFLARE_TUNNEL_TOKEN` is set, `scripts/run_cloudflare_tunnel.sh` automatically runs the named tunnel instead of a quick tunnel.
-
-This is the best production path because:
-
-- the hostname stays fixed across restarts
-- Streamlit secrets do not need to change after reboots
-- the deployment is much less brittle than quick tunnels
-
-Step by step:
-
-1. In the Cloudflare dashboard, go to Zero Trust.
-2. Open Networks > Tunnels.
-3. Create a new Cloudflare Tunnel for this backend.
-4. Choose the Windows connector flow.
-5. Add a public hostname that points to `http://127.0.0.1:8001`.
-6. Copy the tunnel token.
-7. Paste that token into `backend/.env` as `CLOUDFLARE_TUNNEL_TOKEN=...`.
-8. Start the backend with `bash scripts/run_windows_stack.sh`.
-9. Put the resulting fixed hostname into Streamlit secrets as `api_base`.
+1. In the Cloudflare dashboard, go to Zero Trust > Networks > Tunnels and create a tunnel.
+2. Add a public hostname that points to `http://127.0.0.1:8001`.
+3. Copy the tunnel token.
+4. Edit `runtime/services/CassiniTunnel.xml` and replace the `<arguments>` with `tunnel --no-autoupdate --metrics 127.0.0.1:20241 run --token YOUR_TOKEN`, then run `cassini.bat restart-tunnel`. Alternatively, run Cloudflare's own `cloudflared service install YOUR_TOKEN` and `cassini.bat` will leave it alone.
+5. Put the fixed hostname into the Streamlit secrets as `api_base`.
 
 Official references:
 
 - Tunnel tokens: https://developers.cloudflare.com/tunnel/advanced/tunnel-tokens/
 - Useful tunnel commands: https://developers.cloudflare.com/tunnel/advanced/local-management/tunnel-useful-commands/
 
-## Optional: Task Scheduler Instead Of A Visible Terminal
+## Legacy Terminal Runners
 
-If you prefer not to keep a Git Bash window open, create a Windows Task Scheduler job that runs at startup.
-
-Recommended settings:
-
-- Name: `Cassini BlueFors Backend`
-- Trigger: `At startup`
-- General: `Run whether user is logged on or not`
-- General: `Run with highest privileges`
-- Conditions: uncheck `Start the task only if the computer is on AC power` if needed for your machine
-- Settings: `If the task fails, restart every 1 minute`
-- Settings: `Attempt to restart up to 3 times`
-- Settings: `If the task is already running, then the following rule applies: Do not start a new instance`
-- Program/script: `C:\Program Files\Git\bin\bash.exe`
-- Start in: `C:\Users\Fitzlab\cassini_monitor_fitzlab`
-- Add arguments:
-
-```text
--lc "cd '/c/Users/Fitzlab/cassini_monitor_fitzlab' && bash scripts/run_windows_stack.sh"
-```
-
-Path note:
-
-- `C:\Users\Fitzlab\cassini_monitor_fitzlab` is the normal Windows path and belongs in Task Scheduler's `Start in` field.
-- `/c/Users/Fitzlab/cassini_monitor_fitzlab` is the Git Bash version of the same path and belongs inside the `bash -lc "cd ..."` command.
-- You do not need `..` there. In Git Bash, the `C:` drive is mounted as `/c`.
-
-If you use Task Scheduler with a quick tunnel, remember that the public URL may change after a reboot, which means `api_base` in Streamlit secrets may need to be updated again.
-
-### If you want to run the tunnel separately
-
-If you decide to manage the Cloudflare tunnel separately from the bash stack, you can disable the tunnel child process and only run sync + API:
-
-```text
--lc "cd '/c/Users/Fitzlab/cassini_monitor_fitzlab' && RUN_TUNNEL=0 bash scripts/run_windows_stack.sh"
-```
-
-That is useful if you later move the tunnel onto a dedicated Cloudflare-managed Windows service.
-
-## DuckDB Mirror Design
-
-The backend keeps a local DuckDB mirror so the API stays fast and the dashboard can request time-series data without reparsing raw text files on every request.
-
-The sync strategy is:
-
-- treat each BlueFors day folder as one source unit
-- compute a signature from file sizes and modification times
-- only rebuild day folders whose contents changed
-- replace rows for that day in the DuckDB database
-- refresh a readonly snapshot after each successful sync pass
-
-This keeps the minute-by-minute update loop lightweight while still allowing a full historical backfill from the original BlueFors logs.
-
-## Useful Commands
-
-Initial backfill:
-
-```bash
-bash scripts/run_sync_once.sh
-```
-
-Continuous live sync:
-
-```bash
-bash scripts/run_sync_loop.sh
-```
-
-Local API only:
-
-```bash
-bash scripts/run_api.sh
-```
-
-Tunnel only:
-
-```bash
-bash scripts/run_cloudflare_tunnel.sh
-```
-
-All-in-one Windows stack:
-
-```bash
-bash scripts/run_windows_stack.sh
-```
+The Git Bash scripts in `scripts/` (`run_windows_stack.sh`, `run_api.sh`, `run_sync_loop.sh`, ...) still work for debugging, using `runtime/python` when present. `run_windows_stack.sh` refuses to start while the CassiniAPI service is running, because both would compete for port 8001 and the database file.
 
 ## Troubleshooting
 
+### The dashboard says "Could not load data from the API"
+
+1. Run `cassini.bat` (status). If the local API is healthy and the public `/health` check passes, the Streamlit `api_base` is out of date. Paste the URL from `cassini.bat url` into the secrets.
+2. If the public check fails, look at `logs/CassiniTunnel.err.log` and `logs/CassiniAPI.err.log`.
+
 ### The dashboard is stale
 
-Check:
-
-- `logs/windows-sync-loop.log`
-- `http://127.0.0.1:8001/health`
-
-If the local health endpoint is fresh but Streamlit is stale, the issue is usually the public tunnel URL or Streamlit secrets.
-
-### The tunnel started but Streamlit still cannot connect
-
-- If you are using a quick tunnel, make sure `api_base` matches the latest printed `trycloudflare.com` URL.
-- If you are using a named tunnel, make sure the hostname points at the correct Cloudflare tunnel and the tunnel token is valid.
+Check `data_age_seconds` and `sync.last_error` in `http://127.0.0.1:8001/health`. If the sync has no errors but the data is old, BlueFors itself has stopped writing logs. Check the newest folder under `C:\Users\Fitzlab\Bluefors logs`.
 
 ### The MXC temperature is missing
 
 That usually means the BlueFors `CH6 T ...log` file is absent or the sensor is out of readable range. The sync preserves missing values as missing values rather than fabricating them.
-
-### The first sync takes a while
-
-That is normal. The first pass may backfill many daily folders. Later passes only rebuild folders that changed.
 
 ## Notes For Other Labs
 

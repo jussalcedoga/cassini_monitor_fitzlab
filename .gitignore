@@ -11,3 +11,6 @@ __pycache__/
 *.pyc
 .DS_Store
 .streamlit/secrets.toml
+runtime/
+cloudflared.exe
+CURRENT_PUBLIC_URL.txt

@@ -3,6 +3,12 @@ set -euo pipefail
 
 source "$(cd "$(dirname "$0")" && pwd)/common.sh"
 
+if command -v sc.exe >/dev/null 2>&1 && sc.exe query CassiniAPI 2>/dev/null | grep -q RUNNING; then
+  echo "The CassiniAPI Windows service is already running this stack (see cassini.bat status)." >&2
+  echo "Use 'cassini.bat stop' first if you really want to run it from a terminal." >&2
+  exit 1
+fi
+
 LOG_DIR="$ROOT/logs"
 mkdir -p "$LOG_DIR"
 RUN_SYNC="${RUN_SYNC:-1}"

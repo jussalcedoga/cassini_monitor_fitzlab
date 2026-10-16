@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 backend_python() {
   local candidates=(
+    "$ROOT/runtime/python/python.exe"
     "$ROOT/backend/.venv/Scripts/python.exe"
     "$ROOT/backend/.venv/bin/python"
   )

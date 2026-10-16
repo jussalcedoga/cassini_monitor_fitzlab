@@ -1,6 +1,10 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import hashlib
+import hmac
+import json
 import math
 from pathlib import Path
+import threading
 import time
 from typing import Dict, Optional
 
@@ -15,6 +19,14 @@ from PIL import Image
 API_BASE = st.secrets["api_base"].rstrip("/")
 API_KEY = st.secrets["api_key"]
 DASHBOARD_PASSWORD = st.secrets["dashboard_password"]
+# Optional: follow Cloudflare quick-tunnel URL changes. The backend publishes
+# its current URL, HMAC-signed with api_url_key, to the ntfy topic api_url_topic.
+# Without these secrets the app uses api_base only.
+API_URL_TOPIC = st.secrets.get("api_url_topic", "")
+API_URL_KEY = st.secrets.get("api_url_key", "")
+API_URL_SERVER = st.secrets.get("api_url_server", "https://ntfy.sh").rstrip("/")
+API_URL_REFRESH_SECONDS = 300
+API_URL_RECHECK_SECONDS = 30
 REQUEST_TIMEOUT_SECONDS = 10
 PLOT_MAX_POINTS = 1200
 FETCH_RETRIES = 1
@@ -104,6 +116,27 @@ COLORS = {
     "scroll_1": "#a855f7",
     "scroll_2": "#f43f5e",
 }
+
+# Cooldown / warm-up markers overlaid on every time-series plot. Colors match
+# the "cooling" and "warming" fridge-state cards.
+PHASE_STYLES = {
+    "cooldown": {
+        "label": "Cooldown started",
+        "color": "#3b82f6",
+        "fill": "rgba(59, 130, 246, 0.07)",
+    },
+    "warmup": {
+        "label": "Warm-up started",
+        "color": "#f97316",
+        "fill": "rgba(249, 115, 22, 0.07)",
+    },
+}
+PHASE_MIN_DURATION_H = 2.0  # ignore pulse-tube on/off blips shorter than this
+
+# Fridge-state heuristics when the MXC thermometer is out of range.
+STAGE_TREND_KPH = 0.5  # 50 K / 4 K stage drift that counts as a real trend
+STAGE_AMBIENT_K = 250.0
+FOUR_K_COLD_K = 10.0
 
 st.markdown(
     """
@@ -277,8 +310,7 @@ if "ok" not in st.session_state:
 
 
 def mount_theme_bridge() -> None:
-    components.html(
-        """
+    script = """
         <script>
         const applyCassiniTheme = () => {
           const parentDoc = window.parent.document;
@@ -292,9 +324,12 @@ def mount_theme_bridge() -> None:
         observer.observe(window.parent.document.body, { childList: true, subtree: true, attributes: true });
         window.addEventListener('beforeunload', () => observer.disconnect(), { once: true });
         </script>
-        """,
-        height=0,
-    )
+        """
+    # st.components.v1.html is deprecated in favour of st.iframe (Streamlit 1.5x+).
+    if hasattr(st, "iframe"):
+        st.iframe(script, height="content")
+    else:
+        components.html(script, height=0)
 
 
 mount_theme_bridge()
@@ -366,22 +401,79 @@ def empty_history_df() -> pd.DataFrame:
     return pd.DataFrame(columns=["ts_eastern", "value"])
 
 
+@st.cache_resource
+def api_base_state() -> dict:
+    return {"url": None, "working": None, "checked_at": 0.0, "lock": threading.Lock()}
+
+
+def lookup_announced_api_base() -> Optional[str]:
+    """Newest correctly signed API URL the backend announced on its ntfy topic."""
+    response = requests.get(
+        f"{API_URL_SERVER}/{API_URL_TOPIC}/json",
+        params={"poll": "1", "since": "all"},
+        timeout=5,
+    )
+    response.raise_for_status()
+    newest = None
+    for line in response.text.splitlines():
+        try:
+            payload = json.loads(json.loads(line).get("message", ""))
+            url, ts, sig = str(payload["url"]), int(payload["ts"]), str(payload["sig"])
+        except (ValueError, KeyError, TypeError, AttributeError):
+            continue
+        expected = hmac.new(API_URL_KEY.encode(), f"{url}|{ts}".encode(), hashlib.sha256).hexdigest()
+        if url.startswith("https://") and hmac.compare_digest(expected, sig):
+            if newest is None or ts > newest[0]:
+                newest = (ts, url.rstrip("/"))
+    return newest[1] if newest else None
+
+
+def api_base_candidates(recheck: bool = False) -> list:
+    """API base URLs to try, best first: last working, newest announced, api_base."""
+    state = api_base_state()
+    if API_URL_TOPIC and API_URL_KEY:
+        with state["lock"]:
+            age = time.time() - state["checked_at"]
+            if age >= API_URL_REFRESH_SECONDS or (recheck and age >= API_URL_RECHECK_SECONDS):
+                state["checked_at"] = time.time()
+                try:
+                    state["url"] = lookup_announced_api_base() or state["url"]
+                except requests.RequestException:
+                    pass
+    candidates = []
+    for base in (state["working"], state["url"], API_BASE):
+        if base and base not in candidates:
+            candidates.append(base)
+    return candidates
+
+
+def current_api_base() -> str:
+    return api_base_candidates()[0]
+
+
 def fetch_json(path: str, params: Optional[dict] = None):
     last_error = None
     for attempt in range(FETCH_RETRIES + 1):
-        try:
-            response = requests.get(
-                f"{API_BASE}{path}",
-                headers=HEADERS,
-                params=params or {},
-                timeout=REQUEST_TIMEOUT_SECONDS,
-            )
-            response.raise_for_status()
-            return response.json()
-        except requests.RequestException as exc:
-            last_error = exc
-            if attempt >= FETCH_RETRIES:
-                raise
+        for base in api_base_candidates(recheck=attempt > 0):
+            try:
+                response = requests.get(
+                    f"{base}{path}",
+                    headers=HEADERS,
+                    params=params or {},
+                    timeout=REQUEST_TIMEOUT_SECONDS,
+                )
+                response.raise_for_status()
+                api_base_state()["working"] = base
+                return response.json()
+            except requests.HTTPError as exc:
+                # A 4xx means this API answered but rejected the request;
+                # another base will not do better. 5xx/530 can be a dead tunnel.
+                if exc.response is not None and exc.response.status_code < 500:
+                    raise
+                last_error = exc
+            except requests.RequestException as exc:
+                last_error = exc
+        if attempt < FETCH_RETRIES:
             time.sleep(FETCH_RETRY_SLEEP_SECONDS * (attempt + 1))
     raise last_error
 
@@ -595,7 +687,168 @@ def recent_temperature_slope(df: pd.DataFrame, lookback_hours: int = 3) -> Optio
     return float((recent["value"].iloc[-1] - recent["value"].iloc[0]) / dt_hours)
 
 
-def fridge_state(latest: dict, histories: Dict[str, pd.DataFrame]) -> tuple[str, str, str]:
+def parse_phase_events(raw_events) -> list:
+    events = []
+    for event in raw_events or []:
+        kind = event.get("kind")
+        ts = pd.to_datetime(event.get("ts_eastern"), errors="coerce")
+        if kind in PHASE_STYLES and not pd.isna(ts):
+            events.append({"ts": ts, "kind": kind, "label": PHASE_STYLES[kind]["label"]})
+    return sorted(events, key=lambda event: event["ts"])
+
+
+def derive_phase_events(pulse_tube_df: pd.DataFrame) -> list:
+    """Fallback when the API has no /events: pulse-tube switching in the plotted window."""
+    if pulse_tube_df.empty:
+        return []
+    df = pulse_tube_df.copy()
+    df["ts_eastern"] = pd.to_datetime(df["ts_eastern"], errors="coerce")
+    df["on"] = pd.to_numeric(df["value"], errors="coerce") >= 0.5
+    df = df.dropna(subset=["ts_eastern"]).sort_values("ts_eastern")
+    if df.empty:
+        return []
+
+    starts = df[df["on"] != df["on"].shift()]
+    segments = []
+    for i, (ts, on) in enumerate(zip(starts["ts_eastern"], starts["on"])):
+        end = starts["ts_eastern"].iloc[i + 1] if i + 1 < len(starts) else df["ts_eastern"].iloc[-1]
+        segments.append([ts, end, bool(on)])
+    last = len(segments) - 1
+    kept = [
+        seg for i, seg in enumerate(segments)
+        if i in (0, last) or (seg[1] - seg[0]).total_seconds() / 3600.0 >= PHASE_MIN_DURATION_H
+    ]
+    merged = []
+    for seg in kept:
+        if merged and merged[-1][2] == seg[2]:
+            merged[-1][1] = seg[1]
+        else:
+            merged.append(seg)
+    return [
+        {"ts": start, "kind": "cooldown" if on else "warmup", "label": PHASE_STYLES["cooldown" if on else "warmup"]["label"]}
+        for start, _, on in merged[1:]
+    ]
+
+
+def fmt_age(hours: float) -> str:
+    if hours < 1.0:
+        return f"{hours * 60:.0f} min"
+    if hours < 48.0:
+        return f"{hours:.1f} h"
+    return f"{hours / 24.0:.1f} d"
+
+
+def phase_since_text(phase_events: list, current_ts) -> str:
+    if not phase_events or pd.isna(current_ts):
+        return ""
+    past = [event for event in phase_events if event["ts"] <= current_ts]
+    if not past:
+        return ""
+    event = past[-1]
+    age_h = max(0.0, (current_ts - event["ts"]).total_seconds() / 3600.0)
+    return f"{event['label']} {event['ts']:%b %d %H:%M} ({fmt_age(age_h)} ago)."
+
+
+def add_phase_markers(fig: go.Figure, phase_events: list, x_start, x_end) -> None:
+    """Dashed line + label at each cooldown / warm-up start, shading the phase that follows."""
+    if not phase_events or pd.isna(x_start) or pd.isna(x_end) or x_end <= x_start:
+        return
+    span = x_end - x_start
+    visible = [event for event in phase_events if x_start <= event["ts"] <= x_end]
+    previous_label_ts = None
+    for event in visible:
+        style = PHASE_STYLES[event["kind"]]
+        later = [other["ts"] for other in phase_events if other["ts"] > event["ts"]]
+        shade_end = min(later[0], x_end) if later else x_end
+        fig.add_vrect(x0=event["ts"], x1=shade_end, fillcolor=style["fill"], line_width=0, layer="below")
+        fig.add_shape(
+            type="line",
+            xref="x",
+            yref="paper",
+            x0=event["ts"],
+            x1=event["ts"],
+            y0=0,
+            y1=1,
+            line=dict(color=style["color"], width=2.2, dash="dash"),
+        )
+        # Pill-shaped label just above the plot frame (WebGL traces would
+        # draw over a label placed inside the plot). Labels that would
+        # collide with the previous one drop to the top inside edge.
+        crowded = previous_label_ts is not None and (event["ts"] - previous_label_ts) < 0.28 * span
+        near_right_edge = (event["ts"] - x_start) > 0.72 * span
+        fig.add_annotation(
+            x=event["ts"],
+            xref="x",
+            y=0.985 if crowded else 1.0,
+            yref="paper",
+            yanchor="top" if crowded else "bottom",
+            yshift=0 if crowded else 3,
+            xanchor="right" if near_right_edge else "left",
+            xshift=-5 if near_right_edge else 5,
+            text=f"<b>{event['label']}</b> · {event['ts']:%b %d %H:%M}",
+            showarrow=False,
+            font=dict(size=12.5, color="#ffffff"),
+            bgcolor=style["color"],
+            borderpad=4,
+            opacity=0.95,
+        )
+        previous_label_ts = event["ts"]
+
+
+def is_on(value) -> bool:
+    return not is_missing(value) and float(value) >= 0.5
+
+
+STAGE_SHORT_NAMES = {"T_50K": "50 K", "T_4K": "4 K", "T_Still": "Still"}
+
+
+def stage_trend_text(temps: Dict[str, float], slopes: Dict[str, Optional[float]]) -> str:
+    """Compact stage summary for the state card, e.g. '50 K 259 K ↓11.8 K/h · 4 K 275 K ↓6.6 K/h'."""
+    parts = []
+    for key, name in STAGE_SHORT_NAMES.items():
+        if key not in temps:
+            continue
+        value = temps[key]
+        reading = f"{value:.0f} K" if value >= 100 else f"{value:.1f} K" if value >= 1 else fmt_temp(value, always_mk=True)
+        slope = slopes.get(key)
+        trend = f" {'↓' if slope < 0 else '↑'}{abs(slope):.1f} K/h" if slope is not None and abs(slope) >= 0.1 else ""
+        parts.append(f"{name} {reading}{trend}")
+    return " · ".join(parts)
+
+
+def fridge_state_without_mxc(latest: dict, histories: Dict[str, pd.DataFrame], since: str) -> tuple[str, str, str]:
+    """Classify from the 50 K / 4 K / Still stages and pump states while the MXC sensor is out of range."""
+    temps = {}
+    for key in ("T_50K", "T_4K", "T_Still"):
+        value = freshest_value(latest, histories, key)
+        if not is_missing(value):
+            temps[key] = float(value)
+    if not temps:
+        return "Unknown", "No stage temperatures are available.", "default"
+
+    slopes = {key: recent_temperature_slope(histories.get(key, empty_history_df()), lookback_hours=3) for key in temps}
+    warm_stage_slopes = [slopes[key] for key in ("T_50K", "T_4K") if slopes.get(key) is not None]
+    stages_cooling = any(slope <= -STAGE_TREND_KPH for slope in warm_stage_slopes)
+    stages_warming = any(slope >= STAGE_TREND_KPH for slope in warm_stage_slopes)
+    pulse_tube_on = is_on(freshest_value(latest, histories, "pulse_tube"))
+    four_k = temps.get("T_4K")
+    below_ambient = any(temps[key] < STAGE_AMBIENT_K for key in ("T_50K", "T_4K") if key in temps)
+    stages = stage_trend_text(temps, slopes)
+    suffix = f" {since}" if since else ""
+
+    if pulse_tube_on:
+        if stages_warming and not stages_cooling:
+            return "Warming up", f"Stages warming with the pulse tube on: {stages}.{suffix}", "warming"
+        if four_k is not None and four_k <= FOUR_K_COLD_K:
+            return "Cooling down", f"4 K stage cold; Still/MXC cooling toward base. {stages}.{suffix}", "cooling"
+        return "Precooling", f"{stages}. MXC sensor not in range yet.{suffix}", "cooling"
+
+    if stages_warming or below_ambient:
+        return "Warming up", f"Pulse tube off. {stages}.{suffix}", "warming"
+    return "Warm", f"Pulse tube off; stages near ambient. {stages}.", "default"
+
+
+def fridge_state(latest: dict, histories: Dict[str, pd.DataFrame], phase_events: Optional[list] = None) -> tuple[str, str, str]:
     mxc_history = histories.get("T_MXC", empty_history_df())
     mxc = freshest_value(latest, histories, "T_MXC")
     still = freshest_value(latest, histories, "T_Still")
@@ -616,6 +869,8 @@ def fridge_state(latest: dict, histories: Dict[str, pd.DataFrame]) -> tuple[str,
         not is_missing(value) and float(value) >= 0.5
         for value in (pulse_tube, turbo, scroll_1, scroll_2)
     )
+    since = phase_since_text(phase_events or [], current_ts)
+    suffix = f" {since}" if since else ""
 
     if is_missing(mxc):
         if not is_missing(last_valid_mxc) and not pd.isna(last_valid_mxc_ts) and not pd.isna(current_ts):
@@ -626,7 +881,9 @@ def fridge_state(latest: dict, histories: Dict[str, pd.DataFrame]) -> tuple[str,
                     f"Last valid MXC point was {fmt_temp(last_valid_mxc, always_mk=True)}; the fridge appears colder than the readable sensor floor.",
                     "sensor-floor",
                 )
-        return "Unknown", "MXC reading unavailable.", "default"
+        # The MXC thermometer is out of range while the fridge is warm or
+        # precooling; fall back to the other stages and the pump states.
+        return fridge_state_without_mxc(latest, histories, since)
 
     mxc = float(mxc)
     warm_threshold = MXC_WARM_TREND_KPH if mxc < 0.05 else 0.01
@@ -639,33 +896,48 @@ def fridge_state(latest: dict, histories: Dict[str, pd.DataFrame]) -> tuple[str,
     )
 
     if in_warm_band:
+        # Far from base, the MXC trend is slow; the pulse tube and the warm
+        # stages tell whether a cooldown or a warm-up is under way.
+        warm_state = fridge_state_without_mxc(latest, histories, since)
+        if warm_state[0] in {"Precooling", "Cooling down", "Warming up"}:
+            return warm_state
         return "Warm", "Cryostat is still near ambient temperature and far from base.", "default"
 
     if slope is not None and slope >= warm_threshold:
-        return "Warming up", "MXC is trending warmer.", "warming"
+        return "Warming up", f"MXC is trending warmer.{suffix}", "warming"
 
     if in_base_band:
-        return "At base", f"MXC is at {fmt_temp(mxc, always_mk=True)} and within the base-temperature band.", "base"
+        return "At base", f"MXC is at {fmt_temp(mxc, always_mk=True)} and within the base-temperature band.{suffix}", "base"
 
     if pumps_on and (
         mxc >= MXC_PRECOOL_THRESHOLD_K
         or (still_value is not None and still_value >= STILL_PRECOOL_THRESHOLD_K)
     ):
-        return "Precooling", "Cryostat is far above base and still in the warm part of the cooldown.", "cooling"
+        return "Precooling", f"Cryostat is far above base and still in the warm part of the cooldown.{suffix}", "cooling"
 
     if slope is not None and slope <= -cool_threshold:
-        return "Cooling down", "MXC is still trending colder.", "cooling"
+        return "Cooling down", f"MXC is still trending colder.{suffix}", "cooling"
 
     if not pumps_on and (mxc >= 0.02 or (still_value is not None and still_value > 1.0)):
-        return "Warming up", "Cooling hardware is not fully engaged.", "warming"
+        return "Warming up", f"Cooling hardware is not fully engaged.{suffix}", "warming"
 
     if pumps_on and mxc >= 0.02:
-        return "Cooling down", "Cooling hardware is active above base temperature.", "cooling"
+        return "Cooling down", f"Cooling hardware is active above base temperature.{suffix}", "cooling"
 
     if mxc < 0.02:
-        return "At base", "Cryostat is holding near its base temperature.", "base"
+        return "At base", f"Cryostat is holding near its base temperature.{suffix}", "base"
 
-    return "Cooling down", "Cryostat is settling toward a colder state.", "cooling"
+    return "Cooling down", f"Cryostat is settling toward a colder state.{suffix}", "cooling"
+
+
+@st.cache_data(show_spinner=False, ttl=60)
+def load_phase_events() -> Optional[list]:
+    """Cooldown / warm-up starts over the full record, or None if the API has no /events."""
+    try:
+        payload = fetch_json("/events")
+    except requests.RequestException:
+        return None
+    return payload.get("events") if isinstance(payload, dict) else None
 
 
 @st.cache_data(show_spinner=False, ttl=20)
@@ -905,12 +1177,19 @@ def make_multi_trace_figure(
     yaxis_title: str,
     log_y: bool = False,
     height: int = 500,
+    phase_events: Optional[list] = None,
 ) -> go.Figure:
     fig = go.Figure()
+    x_start, x_end = pd.NaT, pd.NaT
 
     for key, df in series.items():
         if df.empty:
             continue
+
+        x_values = pd.to_datetime(df["ts_eastern"], errors="coerce").dropna()
+        if not x_values.empty:
+            x_start = x_values.min() if pd.isna(x_start) else min(x_start, x_values.min())
+            x_end = x_values.max() if pd.isna(x_end) else max(x_end, x_values.max())
 
         line_width = 4.9 if str(key).startswith("P") else 4.4
         value_suffix = ""
@@ -993,6 +1272,8 @@ def make_multi_trace_figure(
     if log_y:
         fig.update_yaxes(type="log")
 
+    add_phase_markers(fig, phase_events or [], x_start, x_end)
+
     return fig
 
 
@@ -1031,7 +1312,7 @@ with st.sidebar:
     st.markdown("---")
     st.caption("FitzLab • Dartmouth Engineering")
     st.markdown("### API endpoint")
-    st.code(API_BASE, language=None)
+    st.code(current_api_base(), language=None)
     st.markdown("[FitzLab Website](https://sites.google.com/view/fitzlab/home)")
     st.markdown("[Main Designer: Juan Salcedo](https://www.linkedin.com/in/jussalcedoga/)")
 
@@ -1100,7 +1381,7 @@ def render_dashboard_page():
         )
     with hero_cols[2]:
         if cassini is not None:
-            st.image(cassini, use_container_width=True)
+            st.image(cassini, width="stretch")
 
     st.markdown('<div class="hero-spacer"></div>', unsafe_allow_html=True)
 
@@ -1140,10 +1421,17 @@ def render_dashboard_page():
     flow_hist = {key: histories.get(key, empty_history_df()) for key in FLOW_KEYS}
     state_hist = {key: histories.get(key, empty_history_df()) for key in STATE_KEYS}
 
+    raw_phase_events = load_phase_events()
+    phase_events = (
+        parse_phase_events(raw_phase_events)
+        if raw_phase_events is not None
+        else derive_phase_events(state_hist["pulse_tube"])
+    )
+
     mxc_recent = temp_hist["T_MXC"]
     duty_cycle = {key: duty_cycle_percent(state_hist[key]) for key in STATE_KEYS}
     state_starts = {key: count_state_starts(state_hist[key], lookback_hours=24) for key in STATE_KEYS}
-    fridge_status, fridge_status_help, fridge_status_tone = fridge_state(latest, histories)
+    fridge_status, fridge_status_help, fridge_status_tone = fridge_state(latest, histories, phase_events)
     below_20mk_h = time_below_threshold_hours(mxc_recent, threshold=0.020)
     total_below_20mk = metrics.get("hours_below_20mK_total")
     total_below_20mk_help = "Available over the full record"
@@ -1186,7 +1474,9 @@ def render_dashboard_page():
         st.write("")
         st.markdown(f"### {hours}-hour summary")
         st.markdown(
-            '<div class="section-caption">Grouped time-domain plots with thicker traces, readable legends, and explicit time labeling.</div>',
+            '<div class="section-caption">Grouped time-domain plots with thicker traces, readable legends, and explicit time labeling. '
+            'Dashed markers show when a <span style="color:#3b82f6;font-weight:600">cooldown</span> or '
+            '<span style="color:#f97316;font-weight:600">warm-up</span> started (pulse tube switched on or off).</div>',
             unsafe_allow_html=True,
         )
 
@@ -1202,11 +1492,12 @@ def render_dashboard_page():
             yaxis_title="Temperature [K]",
             log_y=temp_scale_overview == "Log",
             height=540,
+            phase_events=phase_events,
         )
         st.plotly_chart(
             fig_temp,
             theme=PLOTLY_THEME,
-            use_container_width=True,
+            width="stretch",
             config={"displaylogo": False, "responsive": True},
         )
 
@@ -1218,11 +1509,12 @@ def render_dashboard_page():
             yaxis_title=f"Pressure [{PRESSURE_UNIT}]",
             log_y=True,
             height=560,
+            phase_events=phase_events,
         )
         st.plotly_chart(
             fig_press,
             theme=PLOTLY_THEME,
-            use_container_width=True,
+            width="stretch",
             config={"displaylogo": False, "responsive": True},
         )
 
@@ -1245,11 +1537,12 @@ def render_dashboard_page():
             yaxis_title="Temperature [K]",
             log_y=temp_scale == "Log",
             height=580,
+            phase_events=phase_events,
         )
         st.plotly_chart(
             fig_temp,
             theme=PLOTLY_THEME,
-            use_container_width=True,
+            width="stretch",
             config={"displaylogo": False, "responsive": True},
         )
 
@@ -1289,11 +1582,12 @@ def render_dashboard_page():
             yaxis_title=f"Pressure [{PRESSURE_UNIT}]",
             log_y=True,
             height=600,
+            phase_events=phase_events,
         )
         st.plotly_chart(
             fig_press,
             theme=PLOTLY_THEME,
-            use_container_width=True,
+            width="stretch",
             config={"displaylogo": False, "responsive": True},
         )
 
@@ -1312,11 +1606,12 @@ def render_dashboard_page():
             yaxis_title="Flow",
             log_y=False,
             height=450,
+            phase_events=phase_events,
         )
         st.plotly_chart(
             fig_flow,
             theme=PLOTLY_THEME,
-            use_container_width=True,
+            width="stretch",
             config={"displaylogo": False, "responsive": True},
         )
 
@@ -1437,11 +1732,12 @@ def render_dashboard_page():
                         yaxis_title="Effective temperature [K]",
                         log_y=em_scale == "Log",
                         height=560,
+                        phase_events=phase_events,
                     )
                     st.plotly_chart(
                         fig_em,
                         theme=PLOTLY_THEME,
-                        use_container_width=True,
+                        width="stretch",
                         config={"displaylogo": False, "responsive": True},
                     )
                 else:
@@ -1510,12 +1806,13 @@ def render_dashboard_page():
             yaxis_title="State",
             log_y=False,
             height=500,
+            phase_events=phase_events,
         )
         fig_state.update_yaxes(range=[-0.1, 1.1], tickvals=[0, 1])
         st.plotly_chart(
             fig_state,
             theme=PLOTLY_THEME,
-            use_container_width=True,
+            width="stretch",
             config={"displaylogo": False, "responsive": True},
         )
 

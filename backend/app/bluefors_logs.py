@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import csv
+import os
 from pathlib import Path
-from typing import Iterable
 
+import numpy as np
 import pandas as pd
 
 READING_COLUMNS = [
@@ -29,6 +29,7 @@ READING_COLUMNS = [
     "pulse_tube",
     "source_file",
 ]
+VALUE_COLUMNS = READING_COLUMNS[1:-1]
 
 TEMPERATURE_FILE_MAP = {
     "ch1 t": "T_50K",
@@ -50,189 +51,180 @@ SIMPLE_VALUE_PREFIXES = {
     "flowmeter": "Flow",
 }
 
+KNOWN_PREFIXES = (
+    *TEMPERATURE_FILE_MAP,
+    *SIMPLE_VALUE_PREFIXES,
+    "channels ",
+    "maxigauge ",
+    "status_",
+    "heaters ",
+    "ch1 r",
+    "ch2 r",
+    "ch5 r",
+    "ch6 r",
+)
 
-def _stem_lower(path: Path) -> str:
-    return path.stem.strip().lower()
+TS_FORMAT = "%d-%m-%y %H:%M:%S"
+
+
+def _is_known_name(name: str) -> bool:
+    lower = name.lower()
+    if not lower.endswith(".log"):
+        return False
+    return lower[:-4].strip().startswith(KNOWN_PREFIXES)
 
 
 def is_known_log_file(path: Path) -> bool:
-    stem = _stem_lower(path)
-    return (
-        any(stem.startswith(prefix) for prefix in TEMPERATURE_FILE_MAP)
-        or any(stem.startswith(prefix) for prefix in SIMPLE_VALUE_PREFIXES)
-        or stem.startswith("channels ")
-        or stem.startswith("maxigauge ")
-        or stem.startswith("status_")
-        or stem.startswith("heaters ")
-        or stem.startswith("ch1 r")
-        or stem.startswith("ch2 r")
-        or stem.startswith("ch5 r")
-        or stem.startswith("ch6 r")
-        or stem.startswith("ch6 t")
-    )
+    return _is_known_name(path.name)
+
+
+def _known_entries(day_dir: Path) -> list[os.DirEntry]:
+    # os.scandir returns size/mtime from the directory listing on Windows,
+    # so signatures cost one listing per folder instead of one stat per file.
+    try:
+        with os.scandir(day_dir) as it:
+            return sorted(
+                (entry for entry in it if entry.is_file() and _is_known_name(entry.name)),
+                key=lambda entry: entry.name,
+            )
+    except (FileNotFoundError, NotADirectoryError, PermissionError):
+        return []
 
 
 def known_log_files(day_dir: Path) -> list[Path]:
-    return sorted(
-        path for path in day_dir.glob("*.log") if path.is_file() and is_known_log_file(path)
-    )
+    return [Path(entry.path) for entry in _known_entries(day_dir)]
 
 
 def day_directories(root: Path) -> list[Path]:
     if not root.exists():
         return []
 
-    direct_logs = known_log_files(root)
-    if direct_logs:
+    if _known_entries(root):
         return [root]
 
-    days = []
-    for child in sorted(path for path in root.iterdir() if path.is_dir()):
-        if known_log_files(child):
-            days.append(child)
-    return days
+    with os.scandir(root) as it:
+        children = sorted(Path(entry.path) for entry in it if entry.is_dir())
+    return [child for child in children if _known_entries(child)]
 
 
 def day_signature(day_dir: Path) -> tuple[int, int]:
-    files = known_log_files(day_dir)
-    if not files:
-        return 0, 0
-
     total_size = 0
     latest_mtime_ns = 0
-    for path in files:
-        stat = path.stat()
+    for entry in _known_entries(day_dir):
+        stat = entry.stat()
         total_size += stat.st_size
         latest_mtime_ns = max(latest_mtime_ns, stat.st_mtime_ns)
     return total_size, latest_mtime_ns
 
 
-def _parse_ts(date_text: str, time_text: str) -> pd.Timestamp:
-    return pd.to_datetime(
-        f"{date_text.strip()} {time_text.strip()}",
-        format="%d-%m-%y %H:%M:%S",
-        errors="coerce",
-    )
+def _read_rows(path: Path) -> list[list[str]]:
+    with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
+        text = handle.read()
+
+    lines = text.splitlines()
+    # BlueFors appends one line per sample. If the writer is mid-line when we
+    # read, the last line is truncated (e.g. "2.935" instead of "2.935215e+02");
+    # drop it and pick it up on the next pass.
+    if lines and not text.endswith(("\n", "\r")):
+        lines.pop()
+    return [line.split(",") for line in lines if line.strip()]
 
 
-def _to_float(value: str):
+def _parse_ts(dates: list[str], times: list[str]) -> pd.DatetimeIndex:
+    stamps = [f"{d.strip()} {t.strip()}" for d, t in zip(dates, times)]
+    return pd.DatetimeIndex(pd.to_datetime(stamps, format=TS_FORMAT, errors="coerce"))
+
+
+def _to_float(value: str) -> float:
     text = value.strip()
     if not text:
-        return None
+        return np.nan
     try:
         return float(text)
     except ValueError:
-        return None
+        return np.nan
 
 
-def _read_rows(path: Path) -> Iterable[list[str]]:
-    with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        reader = csv.reader(handle)
-        for row in reader:
-            if row:
-                yield row
+def _frame(dates: list[str], times: list[str], columns: dict[str, list[float]]) -> pd.DataFrame:
+    if not dates:
+        return pd.DataFrame()
+    df = pd.DataFrame({"ts_eastern": _parse_ts(dates, times), **columns})
+    return df[df["ts_eastern"].notna()]
+
+
+def _pairs(payload: list[str]) -> dict[str, float]:
+    return {payload[idx].strip().lower(): _to_float(payload[idx + 1]) for idx in range(0, len(payload) - 1, 2)}
 
 
 def _simple_value_frame(path: Path, column: str) -> pd.DataFrame:
-    records = []
+    dates, times, values = [], [], []
     for row in _read_rows(path):
         if len(row) < 3:
             continue
-        ts = _parse_ts(row[0], row[1])
-        value = _to_float(row[2])
-        if pd.isna(ts):
-            continue
-        records.append({"ts_eastern": ts, column: value})
-    return pd.DataFrame.from_records(records)
+        dates.append(row[0])
+        times.append(row[1])
+        values.append(_to_float(row[2]))
+    return _frame(dates, times, {column: values})
 
 
 def _channels_frame(path: Path) -> pd.DataFrame:
-    records = []
+    dates, times = [], []
+    cols: dict[str, list[float]] = {"turbo_1": [], "scroll_1": [], "scroll_2": [], "pulse_tube": []}
     for row in _read_rows(path):
         if len(row) < 4:
             continue
-        ts = _parse_ts(row[0], row[1])
-        if pd.isna(ts):
-            continue
-
         payload = row[2:]
         if len(payload) % 2 == 1:
             payload = payload[1:]
+        kv = _pairs(payload)
 
-        key_values: dict[str, float | None] = {}
-        for idx in range(0, len(payload) - 1, 2):
-            key = payload[idx].strip().lower()
-            key_values[key] = _to_float(payload[idx + 1])
+        pulse_tube = kv.get("pulsetube", np.nan)
+        if np.isnan(pulse_tube):
+            pulse_tube = kv.get("compressor", np.nan)
 
-        pulse_tube = key_values.get("pulsetube")
-        if pulse_tube is None:
-            pulse_tube = key_values.get("compressor")
-
-        records.append(
-            {
-                "ts_eastern": ts,
-                "turbo_1": key_values.get("turbo1"),
-                "scroll_1": key_values.get("scroll1"),
-                "scroll_2": key_values.get("scroll2"),
-                "pulse_tube": pulse_tube,
-            }
-        )
-
-    return pd.DataFrame.from_records(records)
+        dates.append(row[0])
+        times.append(row[1])
+        cols["turbo_1"].append(kv.get("turbo1", np.nan))
+        cols["scroll_1"].append(kv.get("scroll1", np.nan))
+        cols["scroll_2"].append(kv.get("scroll2", np.nan))
+        cols["pulse_tube"].append(pulse_tube)
+    return _frame(dates, times, cols)
 
 
 def _status_frame(path: Path) -> pd.DataFrame:
-    records = []
+    dates, times, turbo_status = [], [], []
     for row in _read_rows(path):
         if len(row) < 4:
             continue
-        ts = _parse_ts(row[0], row[1])
-        if pd.isna(ts):
-            continue
-
         payload = row[2:]
         if len(payload) % 2 == 1:
             continue
-
-        key_values: dict[str, float | None] = {}
-        for idx in range(0, len(payload) - 1, 2):
-            key = payload[idx].strip().lower()
-            key_values[key] = _to_float(payload[idx + 1])
-
-        records.append(
-            {
-                "ts_eastern": ts,
-                "turbo_1_status": key_values.get("tc400pumpstatn"),
-                "turbo_2_status": key_values.get("tc400pumpstatn_2"),
-            }
-        )
-
-    return pd.DataFrame.from_records(records)
+        dates.append(row[0])
+        times.append(row[1])
+        turbo_status.append(_pairs(payload).get("tc400pumpstatn", np.nan))
+    return _frame(dates, times, {"turbo_1_status": turbo_status})
 
 
 def _maxigauge_frame(path: Path) -> pd.DataFrame:
-    records = []
+    dates, times = [], []
+    cols: dict[str, list[float]] = {column: [] for column in PRESSURE_CHANNEL_MAP.values()}
     for row in _read_rows(path):
         if len(row) < 8:
             continue
-        ts = _parse_ts(row[0], row[1])
-        if pd.isna(ts):
-            continue
-
         payload = row[2:]
-        record = {"ts_eastern": ts}
+        record = dict.fromkeys(cols, np.nan)
         for idx in range(0, len(payload), 6):
             chunk = payload[idx : idx + 6]
             if len(chunk) < 4:
                 continue
-            channel = chunk[0].strip().upper()
-            column = PRESSURE_CHANNEL_MAP.get(channel)
-            if column is None:
-                continue
-            record[column] = _to_float(chunk[3])
-        records.append(record)
-
-    return pd.DataFrame.from_records(records)
+            column = PRESSURE_CHANNEL_MAP.get(chunk[0].strip().upper())
+            if column is not None:
+                record[column] = _to_float(chunk[3])
+        dates.append(row[0])
+        times.append(row[1])
+        for column, value in record.items():
+            cols[column].append(value)
+    return _frame(dates, times, cols)
 
 
 def _normalize_frame(df: pd.DataFrame) -> pd.DataFrame:
@@ -246,13 +238,13 @@ def _normalize_frame(df: pd.DataFrame) -> pd.DataFrame:
     elif "turbo_1" in df and "turbo_1_status" in df:
         df["turbo_1"] = df["turbo_1"].combine_first(df["turbo_1_status"])
 
-    extra_columns = {"turbo_1_status", "turbo_2_status"}
-    for column in extra_columns.intersection(df.columns):
-        df = df.drop(columns=[column])
+    if "turbo_1_status" in df:
+        df = df.drop(columns=["turbo_1_status"])
 
-    for column in READING_COLUMNS[:-1]:
+    for column in VALUE_COLUMNS:
         if column not in df.columns:
-            df[column] = None
+            df[column] = np.nan
+        df[column] = df[column].astype("float64")
 
     return df[READING_COLUMNS[:-1]]
 
@@ -260,7 +252,7 @@ def _normalize_frame(df: pd.DataFrame) -> pd.DataFrame:
 def build_day_frame(day_dir: Path) -> pd.DataFrame:
     frames: list[pd.DataFrame] = []
     for path in known_log_files(day_dir):
-        stem = _stem_lower(path)
+        stem = path.stem.strip().lower()
         temp_column = next((column for prefix, column in TEMPERATURE_FILE_MAP.items() if stem.startswith(prefix)), None)
         value_column = next((column for prefix, column in SIMPLE_VALUE_PREFIXES.items() if stem.startswith(prefix)), None)
 
@@ -275,13 +267,12 @@ def build_day_frame(day_dir: Path) -> pd.DataFrame:
         elif stem.startswith("status_"):
             frames.append(_status_frame(path))
 
+    frames = [frame.drop_duplicates("ts_eastern", keep="last") for frame in frames if not frame.empty]
     if not frames:
         return pd.DataFrame(columns=READING_COLUMNS)
 
     merged = frames[0]
     for frame in frames[1:]:
-        if frame.empty:
-            continue
         merged = merged.merge(frame, on="ts_eastern", how="outer")
 
     merged = _normalize_frame(merged)

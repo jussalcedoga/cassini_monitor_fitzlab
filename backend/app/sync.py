@@ -1,157 +1,43 @@
 from __future__ import annotations
 
-import errno
-import json
+import logging
 import os
-import shutil
-import tempfile
-from datetime import datetime
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Optional
 
-from app.bluefors_logs import READING_COLUMNS, build_day_frame, day_directories, day_signature
-from app.config import DATA_DIR, DB_PATH, DB_READONLY_PATH, LOG_DIR, LOGS_ROOT, ensure_dirs
-from app.db import connect
+import duckdb
 
-SYNC_LOG = LOG_DIR / "sync.log"
-LOCK_FILE = LOG_DIR / "sync.lock"
-LOCK_STALE_AFTER_SECONDS = int(os.getenv("SYNC_LOCK_STALE_AFTER_SECONDS", "3600"))
-LOCK_PROCESS_HINTS = ("sync_once.py", "run_sync_once.sh")
+from app.bluefors_logs import READING_COLUMNS, build_day_frame, day_directories, day_signature, known_log_files
+from app.config import (
+    COMPACT_INTERVAL_SECONDS,
+    FULL_RESCAN_SECONDS,
+    LOGS_ROOT,
+    RECENT_DAYS,
+    SYNC_INTERVAL_SECONDS,
+    SYNC_TIME_BUDGET_SECONDS,
+    TAIL_RESYNC_MINUTES,
+)
+from app.db import Store
 
+log = logging.getLogger("cassini.sync")
 
-def log(msg: str) -> None:
-    ensure_dirs()
-    line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
-    print(line, flush=True)
-    with SYNC_LOG.open("a", encoding="utf-8") as handle:
-        handle.write(line + "\n")
-
-
-def _lock_age_seconds() -> float:
-    if not LOCK_FILE.exists():
-        return 0.0
-    return max(0.0, datetime.now().timestamp() - LOCK_FILE.stat().st_mtime)
+INSERT_COLUMNS = ", ".join(READING_COLUMNS)
+COMPACT_AFTER_ROWS = 50_000
 
 
-def _read_lock_info() -> dict[str, Any]:
-    info: dict[str, Any] = {"pid": None, "started_at": None}
-    if not LOCK_FILE.exists():
-        return info
-
-    try:
-        raw = LOCK_FILE.read_text(encoding="utf-8").strip()
-    except Exception:
-        return info
-
-    if not raw:
-        return info
-
-    if raw.startswith("{"):
-        try:
-            payload = json.loads(raw)
-            if isinstance(payload, dict):
-                info["pid"] = int(payload.get("pid")) if payload.get("pid") is not None else None
-                info["started_at"] = payload.get("started_at")
-                return info
-        except Exception:
-            pass
-
-    try:
-        info["pid"] = int(raw)
-    except Exception:
-        pass
-    return info
-
-
-def _pid_exists(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError as exc:
-        return exc.errno == errno.EPERM
-
-
-def _pid_looks_like_sync(pid: int) -> bool | None:
-    cmdline_path = Path("/proc") / str(pid) / "cmdline"
-    if not cmdline_path.exists():
-        return None
-
-    try:
-        cmdline = cmdline_path.read_text(encoding="utf-8", errors="ignore").replace("\x00", " ")
-    except Exception:
-        return None
-
-    return any(hint in cmdline for hint in LOCK_PROCESS_HINTS)
-
-
-def _stale_lock_reason() -> str | None:
-    if not LOCK_FILE.exists():
-        return None
-
-    info = _read_lock_info()
-    pid = info.get("pid")
-    age_seconds = _lock_age_seconds()
-
-    if pid is not None:
-        if not _pid_exists(pid):
-            return f"pid {pid} is not running"
-
-        looks_like_sync = _pid_looks_like_sync(pid)
-        if looks_like_sync is False:
-            return f"pid {pid} is not a sync process"
-
-    if age_seconds >= LOCK_STALE_AFTER_SECONDS:
-        age_minutes = round(age_seconds / 60, 1)
-        return f"lock age {age_minutes} minutes exceeds {LOCK_STALE_AFTER_SECONDS} seconds"
-
-    return None
-
-
-def _clear_stale_lock(reason: str) -> None:
-    try:
-        LOCK_FILE.unlink()
-        log(f"cleared stale lock: {reason}")
-    except FileNotFoundError:
-        pass
-    except Exception as exc:
-        log(f"failed to clear stale lock: {exc}")
-
-
-def acquire_lock() -> bool:
-    ensure_dirs()
-    stale_reason = _stale_lock_reason()
-    if stale_reason is not None:
-        _clear_stale_lock(stale_reason)
-
-    try:
-        fd = os.open(str(LOCK_FILE), os.O_CREAT | os.O_EXCL | os.O_RDWR)
-        payload = json.dumps(
-            {
-                "pid": os.getpid(),
-                "started_at": datetime.now().isoformat(timespec="seconds"),
-            }
-        )
-        os.write(fd, payload.encode("utf-8"))
-        os.close(fd)
-        return True
-    except FileExistsError:
-        return False
-
-
-def release_lock() -> None:
-    try:
-        if LOCK_FILE.exists():
-            LOCK_FILE.unlink()
-    except Exception:
-        pass
-
-
-def source_roots(root: Path) -> list[Path]:
-    return day_directories(root)
+@dataclass
+class DayState:
+    size_bytes: int
+    mtime_ns: int
+    max_ts: Optional[datetime]
 
 
 def path_check() -> dict[str, Any]:
-    days = source_roots(LOGS_ROOT) if LOGS_ROOT.exists() else []
+    days = day_directories(LOGS_ROOT) if LOGS_ROOT.exists() else []
     return {
         "logs_root_exists": LOGS_ROOT.exists(),
         "logs_root": str(LOGS_ROOT),
@@ -160,122 +46,247 @@ def path_check() -> dict[str, Any]:
     }
 
 
-def changed_sources(con, day_dirs: list[Path]) -> list[Path]:
-    changed = []
-    for day_dir in day_dirs:
-        size_bytes, mtime_ns = day_signature(day_dir)
-        row = con.execute(
-            "SELECT size_bytes, mtime_ns FROM ingested_files WHERE path = ?",
-            [str(day_dir)],
-        ).fetchone()
-        if row is None or row[0] != size_bytes or row[1] != mtime_ns:
-            changed.append(day_dir)
-    return changed
+class Syncer:
+    """Mirror BlueFors day folders into DuckDB with minimal write churn.
 
+    - New or edited past days are rebuilt in one transaction.
+    - The newest days (still being appended to) only replace the last few
+      minutes of rows, so steady-state churn is a handful of rows per minute.
+    - Days are processed newest-first, so a fresh database serves live data
+      within seconds while history backfills.
+    """
 
-def refresh_readonly_snapshot() -> None:
-    ensure_dirs()
+    def __init__(self, store: Store, logs_root: Path = LOGS_ROOT):
+        self.store = store
+        self.logs_root = logs_root
+        self.days = self._load_days()
+        self.version = 0
+        self.rows_since_compact = 0
+        self.last_compact = time.time()
+        self.summary: dict[str, Any] = {}
+        self.refresh_summary()
 
-    legacy_tmp_path = DB_READONLY_PATH.with_suffix(".tmp")
-    if legacy_tmp_path.exists():
-        try:
-            legacy_tmp_path.unlink()
-            log(f"removed stale legacy snapshot temp file: {legacy_tmp_path}")
-        except Exception as exc:
-            log(f"could not remove legacy snapshot temp file {legacy_tmp_path}: {exc}")
+    def _load_days(self) -> dict[str, DayState]:
+        with self.store.cursor() as cur:
+            rows = cur.execute("SELECT path, size_bytes, mtime_ns, max_ts FROM ingested_days").fetchall()
+        return {path: DayState(size, mtime, max_ts) for path, size, mtime, max_ts in rows}
 
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=f"{DB_READONLY_PATH.stem}.",
-        suffix=".next",
-        dir=str(DATA_DIR),
-    )
-    os.close(fd)
-    tmp_path = Path(tmp_name)
-
-    try:
-        shutil.copy2(DB_PATH, tmp_path)
-        os.chmod(tmp_path, 0o600)
-        os.replace(tmp_path, DB_READONLY_PATH)
-    finally:
-        if tmp_path.exists():
-            try:
-                tmp_path.unlink()
-            except Exception:
-                pass
-
-
-def sync_once() -> dict:
-    if not acquire_lock():
-        log("sync already running, skipping")
-        return {"status": "skipped_locked"}
-
-    con = None
-    try:
-        if not LOGS_ROOT.exists():
-            raise FileNotFoundError(f"BlueFors logs root not found: {LOGS_ROOT}")
-
-        con = connect(write=True)
-        days = source_roots(LOGS_ROOT)
-        changed = changed_sources(con, days)
-
-        log(f"logs_root={LOGS_ROOT}")
-        log(f"discovered_log_sources={len(days)} changed_sources={len(changed)}")
-
-        files_synced = 0
-        latest_ts = None
-
-        for idx, day_dir in enumerate(changed, start=1):
-            size_bytes, mtime_ns = day_signature(day_dir)
-            log(f"[{idx}/{len(changed)}] rebuilding {day_dir}")
-
-            day_df = build_day_frame(day_dir)
-            con.execute("DELETE FROM readings WHERE source_file = ?", [str(day_dir)])
-
-            if not day_df.empty:
-                con.register("day_frame", day_df)
-                con.execute(
-                    f"""
-                    INSERT OR REPLACE INTO readings ({", ".join(READING_COLUMNS)})
-                    SELECT {", ".join(READING_COLUMNS)}
-                    FROM day_frame
-                    """
-                )
-                con.unregister("day_frame")
-
-            con.execute(
-                """
-                INSERT OR REPLACE INTO ingested_files(path, size_bytes, mtime_ns, ingested_at)
-                VALUES (?, ?, ?, NOW())
-                """,
-                [str(day_dir), size_bytes, mtime_ns],
-            )
-            files_synced += 1
-
-        total_rows = con.execute("SELECT COUNT(*) FROM readings").fetchone()[0]
-        total_sources = con.execute("SELECT COUNT(*) FROM ingested_files").fetchone()[0]
-        latest_ts = con.execute("SELECT MAX(ts_eastern) FROM readings").fetchone()[0]
-
-        con.close()
-        con = None
-        refresh_readonly_snapshot()
-
-        result = {
-            "status": "ok",
-            "checked_at": datetime.now().isoformat(timespec="seconds"),
-            "sources_seen": len(days),
-            "sources_changed": len(changed),
-            "sources_synced": files_synced,
-            "tracked_sources": total_sources,
-            "rows_total": total_rows,
-            "latest_ts_eastern": latest_ts.isoformat() if latest_ts is not None else None,
-            "snapshot_path": str(DB_READONLY_PATH),
+    def refresh_summary(self) -> None:
+        with self.store.cursor() as cur:
+            rows_total, latest_ts = cur.execute("SELECT COUNT(*), MAX(ts_eastern) FROM readings").fetchone()
+        self.summary = {
+            "rows_total": rows_total,
+            "latest_ts": latest_ts,
+            "days_tracked": len(self.days),
         }
-        log(json.dumps(result))
-        return result
-    finally:
-        if con is not None:
+
+    def _day_dirs(self) -> list[Path]:
+        if not self.logs_root.exists():
+            raise FileNotFoundError(f"BlueFors logs root not found: {self.logs_root}")
+        if known_log_files(self.logs_root):
+            return [self.logs_root]
+        with os.scandir(self.logs_root) as it:
+            return sorted(Path(entry.path) for entry in it if entry.is_dir())
+
+    def run_once(self, full_scan: bool = False, time_budget: Optional[float] = None) -> dict[str, Any]:
+        started = time.monotonic()
+        children = self._day_dirs()
+        recent = children[-RECENT_DAYS:]
+        recent_keys = {str(path) for path in recent}
+
+        if full_scan:
+            candidates = children
+        else:
+            candidates = [path for path in children if str(path) not in self.days]
+            candidates += [path for path in recent if str(path) in self.days]
+
+        changed: list[tuple[Path, tuple[int, int]]] = []
+        for day_dir in candidates:
+            signature = day_signature(day_dir)
+            if signature == (0, 0):
+                continue
+            state = self.days.get(str(day_dir))
+            if state is None or (state.size_bytes, state.mtime_ns) != signature:
+                changed.append((day_dir, signature))
+        changed.sort(key=lambda item: item[0].name, reverse=True)
+
+        synced = 0
+        for day_dir, signature in changed:
+            if time_budget is not None and synced and time.monotonic() - started > time_budget:
+                break
+            self._sync_day(day_dir, signature, appendable=str(day_dir) in recent_keys)
+            synced += 1
+
+        if synced:
+            self.version += 1
+            self.refresh_summary()
+
+        return {
+            "days_seen": len(children),
+            "days_changed": len(changed),
+            "days_synced": synced,
+            "backlog": len(changed) - synced,
+            "full_scan": full_scan,
+            "elapsed_s": round(time.monotonic() - started, 3),
+        }
+
+    def _sync_day(self, day_dir: Path, signature: tuple[int, int], appendable: bool) -> None:
+        key = str(day_dir)
+        previous = self.days.get(key)
+        frame = build_day_frame(day_dir)
+        max_ts = None if frame.empty else frame["ts_eastern"].max().to_pydatetime()
+
+        tail_only = (
+            appendable
+            and previous is not None
+            and previous.max_ts is not None
+            and signature[0] >= previous.size_bytes
+        )
+
+        with self.store.write_lock, self.store.cursor() as cur:
+            cur.execute("BEGIN TRANSACTION")
             try:
-                con.close()
+                if tail_only:
+                    cutoff = previous.max_ts - timedelta(minutes=TAIL_RESYNC_MINUTES)
+                    cur.execute("DELETE FROM readings WHERE source_file = ? AND ts_eastern >= ?", [key, cutoff])
+                    frame = frame[frame["ts_eastern"] >= cutoff]
+                else:
+                    cur.execute("DELETE FROM readings WHERE source_file = ?", [key])
+
+                if not frame.empty:
+                    cur.register("day_frame", frame)
+                    cur.execute(f"INSERT INTO readings ({INSERT_COLUMNS}) SELECT {INSERT_COLUMNS} FROM day_frame")
+                    cur.unregister("day_frame")
+
+                cur.execute("DELETE FROM ingested_days WHERE path = ?", [key])
+                cur.execute(
+                    "INSERT INTO ingested_days VALUES (?, ?, ?, ?, ?)",
+                    [key, signature[0], signature[1], max_ts, datetime.now()],
+                )
+                cur.execute("COMMIT")
             except Exception:
-                pass
-        release_lock()
+                cur.execute("ROLLBACK")
+                raise
+
+        self.days[key] = DayState(signature[0], signature[1], max_ts)
+        self.rows_since_compact += len(frame)
+
+    def maybe_compact(self, backlog: int) -> bool:
+        if backlog:
+            return False
+        due_by_rows = self.rows_since_compact >= COMPACT_AFTER_ROWS
+        due_by_time = self.rows_since_compact > 0 and time.time() - self.last_compact >= COMPACT_INTERVAL_SECONDS
+        if not (due_by_rows or due_by_time):
+            return False
+        self.compact()
+        return True
+
+    def compact(self) -> None:
+        """Rewrite readings in time order and checkpoint.
+
+        Sorted storage keeps DuckDB's per-row-group min/max pruning effective
+        for time-window queries, and rewriting drops deleted rows so the file
+        stays proportional to the data.
+        """
+        started = time.monotonic()
+        size_before = self.store.size_bytes()
+        with self.store.write_lock, self.store.cursor() as cur:
+            cur.execute("BEGIN TRANSACTION")
+            try:
+                cur.execute("CREATE TEMP TABLE readings_sorted AS SELECT * FROM readings ORDER BY ts_eastern")
+                cur.execute("DELETE FROM readings")
+                cur.execute("INSERT INTO readings SELECT * FROM readings_sorted")
+                cur.execute("DROP TABLE readings_sorted")
+                cur.execute("COMMIT")
+            except Exception:
+                cur.execute("ROLLBACK")
+                raise
+            try:
+                cur.execute("CHECKPOINT")
+            except duckdb.Error as exc:
+                log.warning("checkpoint after compaction deferred: %s", exc)
+
+        self.rows_since_compact = 0
+        self.last_compact = time.time()
+        self.version += 1
+        log.info(
+            "compacted readings in %.1fs (db %.1f MB -> %.1f MB)",
+            time.monotonic() - started,
+            size_before / 1e6,
+            self.store.size_bytes() / 1e6,
+        )
+
+    def sync_all(self) -> dict[str, Any]:
+        """Run until every day folder is mirrored (used by the CLI script)."""
+        result = self.run_once(full_scan=True)
+        while result["backlog"]:
+            result = self.run_once(full_scan=False)
+        self.maybe_compact(0)
+        return result
+
+
+class SyncWorker(threading.Thread):
+    def __init__(self, syncer: Syncer, on_change: Optional[Callable[[], None]] = None):
+        super().__init__(name="sync-worker", daemon=True)
+        self.syncer = syncer
+        self.on_change = on_change
+        self.stop_event = threading.Event()
+        self.heartbeat = time.monotonic()
+        self.last_success_at: Optional[datetime] = None
+        self.last_error: Optional[str] = None
+        self.last_error_at: Optional[datetime] = None
+        self.last_result: dict[str, Any] = {}
+        self.consecutive_errors = 0
+        self._last_full_scan: Optional[float] = None
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+    def run(self) -> None:
+        log.info("sync worker started (logs root: %s)", self.syncer.logs_root)
+        while not self.stop_event.is_set():
+            delay: float = SYNC_INTERVAL_SECONDS
+            try:
+                now = time.monotonic()
+                full_scan = self._last_full_scan is None or now - self._last_full_scan >= FULL_RESCAN_SECONDS
+                result = self.syncer.run_once(full_scan=full_scan, time_budget=SYNC_TIME_BUDGET_SECONDS)
+                if full_scan:
+                    self._last_full_scan = now
+                compacted = self.syncer.maybe_compact(result["backlog"])
+
+                if result["days_synced"] or compacted:
+                    self._notify()
+                if result["backlog"] or (result["days_synced"] > 1):
+                    log.info("sync progress: %s", result)
+
+                self.last_result = result
+                self.last_success_at = datetime.now()
+                self.consecutive_errors = 0
+                if result["backlog"]:
+                    delay = 0.2
+            except Exception as exc:
+                self.consecutive_errors += 1
+                self.last_error = f"{type(exc).__name__}: {exc}"
+                self.last_error_at = datetime.now()
+                log.exception("sync pass failed (%d in a row)", self.consecutive_errors)
+                delay = min(60.0, SYNC_INTERVAL_SECONDS * self.consecutive_errors)
+            self.heartbeat = time.monotonic()
+            self.stop_event.wait(delay)
+
+    def _notify(self) -> None:
+        if self.on_change is None:
+            return
+        try:
+            self.on_change()
+        except Exception:
+            log.exception("post-sync hook failed")
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "last_success_at": self.last_success_at,
+            "last_error": self.last_error,
+            "last_error_at": self.last_error_at,
+            "consecutive_errors": self.consecutive_errors,
+            "last_pass": self.last_result,
+            "interval_s": SYNC_INTERVAL_SECONDS,
+        }
